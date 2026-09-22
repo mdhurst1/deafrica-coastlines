@@ -378,8 +378,7 @@ def certainty_masking(yearly_ds, obs_threshold=5, stdev_threshold=0.25, sieve_si
     # Obtain spatial metadata from rioxarray rather than the legacy ``geobox``
     # attribute used by older xarray/datacube versions.
     crs = yearly_ds.rio.crs
-    transform = yearly_ds.rio.transform()
-
+    
     if crs is None:
         raise ValueError("Input raster dataset has no CRS available via rioxarray.")
 
@@ -391,7 +390,6 @@ def certainty_masking(yearly_ds, obs_threshold=5, stdev_threshold=0.25, sieve_si
         vector_mask = xr_vectorize(
             arr,
             crs=crs,
-            transform=transform,
             attribute_col="certainty",
         )
 
