@@ -129,7 +129,7 @@ def load_rasters(
         # Combine into a single dataset and set CRS
         layer_ds = xr.merge(da_list).squeeze("band", drop=True)
         layer_ds = layer_ds.assign_attrs(layer_da.attrs)
-        layer_ds.attrs["transform"] = Affine(*layer_ds.transform)
+        layer_ds.attrs["transform"] = layer_ds.rio.transform()
         layer_ds = layer_ds.sel(year=slice(str(start_year), str(end_year)))
 
         # Append to list
