@@ -9,3 +9,4 @@ build
 coastlines/_version.py
 deafrica_coastlines.egg-info/
 __pycache__
+*.png
