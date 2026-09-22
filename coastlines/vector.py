@@ -17,6 +17,7 @@ import sys
 import warnings
 import click
 import pyproj
+import rioxarray
 import datacube
 import odc.algo
 import numpy as np
@@ -25,6 +26,7 @@ import xarray as xr
 import geohash as gh
 import geopandas as gpd
 from affine import Affine
+from pathlib import Path
 from rasterio.features import sieve
 from rasterio.transform import array_bounds
 from scipy.stats import circstd, circmean, linregress
@@ -118,7 +120,7 @@ def load_rasters(
             time_var = xr.Variable("year", [int(i.split("/")[-1][0:4]) for i in paths])
 
             # Import data
-            layer_da = xr.concat([xr.open_rasterio(i) for i in paths], dim=time_var)
+            layer_da = xr.concat([rioxarray.open_rasterio(i) for i in paths], dim=time_var)
             layer_da.name = f"{layer_name}"
 
             # Append to file
