@@ -115,6 +115,20 @@ def load_water_index_stac(
     nir = ds.nir08.where(ds.nir08 != 0) * scale + offset
     swir = ds.swir16.where(ds.swir16 != 0) * scale + offset
 
+    # Mask invalid surface-reflectance values.
+    # This mirrors the original DEA Coastlines workflow.
+    green = green.where(
+        (green >= 0) & (green <= 1)
+    )
+
+    nir = nir.where(
+        (nir >= 0) & (nir <= 1)
+    )
+
+    swir = swir.where(
+        (swir >= 0) & (swir <= 1)
+    )
+
     # QA_PIXEL
     #
     # bit 0: fill
