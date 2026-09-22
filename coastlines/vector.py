@@ -25,7 +25,6 @@ import pandas as pd
 import xarray as xr
 import geohash as gh
 import geopandas as gpd
-from affine import Affine
 from pathlib import Path
 from rasterio.features import sieve
 from rasterio.transform import array_bounds
@@ -101,10 +100,12 @@ def load_rasters(
 
         for layer_name in [f"{water_index}", "ndwi", "tide_m", "count", "stdev"]:
             # Get paths of files that match pattern
-            paths = glob.glob(
-                f"{path}/{raster_version}/"
-                f"{study_area}_{raster_version}/"
-                f"*_{layer_name}{layer_type}"
+            paths = sorted(
+                glob.glob(
+                    f"{path}/{raster_version}/"
+                    f"{study_area}_{raster_version}/"
+                    f"*_{layer_name}{layer_type}"
+                )
             )
 
             # Test if data was returned
@@ -130,7 +131,7 @@ def load_rasters(
         layer_ds = xr.merge(da_list).squeeze("band", drop=True)
         layer_ds = layer_ds.assign_attrs(layer_da.attrs)
         layer_ds.attrs["transform"] = layer_ds.rio.transform()
-        layer_ds = layer_ds.sel(year=slice(str(start_year), str(end_year)))
+        layer_ds = layer_ds.sel(year=slice(start_year, end_year))
 
         # Append to list
         ds_list.append(layer_ds)
@@ -140,52 +141,69 @@ def load_rasters(
 
 def ocean_masking(ds, tide_points_gdf, connectivity=1, dilation=None):
     """
-    Identifies ocean by selecting the largest connected area of water
-    pixels that contain tidal modelling points. This region can be
-    optionally dilated to ensure that the sub-pixel algorithm has pixels
-    on either side of the water index threshold.
+    Identifies ocean by selecting connected areas of water pixels that
+    contain tidal/ocean seed points. This region can optionally be dilated
+    to ensure that the sub-pixel algorithm has pixels on either side of the
+    water-index threshold.
 
-    Parameters:
-    -----------
-    ds : xarray.DataArray
-        An array containing True for land pixels, and False for water.
-        This can be obtained by thresholding a water index
-        array (e.g. MNDWI < 0).
-    tide_points_gdf : geopandas.GeoDataFrame
-        Spatial points located within the ocean. These points are used
-        to ensure that all coastlines are directly connected to the
-        ocean.
-    connectivity : integer, optional
-        An integer passed to the 'connectivity' parameter of the
-        `skimage.measure.label` function.
-    dilation : integer, optional
-        The number of pixels to dilate ocean pixels to ensure than
-        adequate land pixels are included for subpixel waterline
-        extraction. Defaults to None.
-
-    Returns:
-    --------
-    ocean_mask : xarray.DataArray
-        An array containing the a mask consisting of identified ocean
-        pixels as True.
+    This version is compatible with modern xarray/scikit-image behaviour.
+    In particular, ``groupby("year")`` may pass a single timestep with shape
+    ``(year=1, y, x)``; 2-D morphology is therefore applied after temporarily
+    squeezing the singleton year dimension.
     """
 
-    # First, break boolean array into unique, discrete regions/blobs
-    blobs = xr.apply_ufunc(label, ds, 1, False, 1)
+    # groupby("year") can retain a singleton year dimension.  The image
+    # morphology below is spatial (2-D), so temporarily remove that dimension.
+    restore_year = False
+    year_values = None
 
-    # Get blob ID for each tidal modelling point
-    x = xr.DataArray(tide_points_gdf.geometry.x, dims="z")
-    y = xr.DataArray(tide_points_gdf.geometry.y, dims="z")
+    if "year" in ds.dims:
+        if ds.sizes["year"] != 1:
+            raise ValueError(
+                "ocean_masking expects a 2-D spatial array or a single-year "
+                "array with year size 1."
+            )
+
+        year_values = ds["year"].values
+        ds = ds.squeeze("year", drop=True)
+        restore_year = True
+
+    # Break the boolean array into unique connected water bodies.  The input
+    # convention is True=land, False=water, so land (1/True) is background.
+    blobs = xr.apply_ufunc(
+        lambda arr: label(
+            arr,
+            background=1,
+            return_num=False,
+            connectivity=connectivity,
+        ),
+        ds,
+    )
+
+    # Get blob IDs intersected by known ocean/tidal modelling points.
+    x = xr.DataArray(tide_points_gdf.geometry.x.to_numpy(), dims="z")
+    y = xr.DataArray(tide_points_gdf.geometry.y.to_numpy(), dims="z")
     ocean_blobs = np.unique(blobs.interp(x=x, y=y, method="nearest"))
 
-    # Return only blobs that contained tide modelling point
-    ocean_mask = blobs.isin(ocean_blobs[ocean_blobs != 0])
+    # Label 0 is background; retain only labelled water bodies intersecting
+    # one or more ocean seed points.
+    ocean_blobs = ocean_blobs[ocean_blobs != 0]
+    ocean_mask = blobs.isin(ocean_blobs)
 
-    # Dilate mask so that we include land pixels on the inland side
-    # of each shoreline to ensure contour extraction accurately
-    # seperates land and water spectra
+    # Dilate in 2-D so contour extraction includes pixels on the inland side
+    # of the shoreline.  Passing footprint by keyword is robust to current
+    # scikit-image signatures.
     if dilation:
-        ocean_mask = xr.apply_ufunc(binary_dilation, ocean_mask, disk(dilation))
+        footprint = disk(dilation)
+        ocean_mask = xr.apply_ufunc(
+            lambda arr: binary_dilation(arr, footprint=footprint),
+            ocean_mask,
+        )
+
+    # Restore the singleton year dimension so xarray GroupBy can recombine
+    # annual results cleanly.
+    if restore_year:
+        ocean_mask = ocean_mask.expand_dims(year=year_values)
 
     return ocean_mask
 
@@ -307,84 +325,81 @@ def temporal_masking(ds):
 
 def certainty_masking(yearly_ds, obs_threshold=5, stdev_threshold=0.25, sieve_size=128):
     """
-    Generate annual vector polygon masks containing information
-    about the certainty of each extracted shoreline feature.
-    These masks are used to assign each shoreline feature with
-    important certainty information to flag potential issues with
-    the data.
+    Generate annual vector polygon masks containing information about the
+    certainty of each extracted shoreline feature.
 
-    Parameters:
-    -----------
-    yearly_ds : xarray.Dataset
-        An `xarray.Dataset` containing annual DE Africa Coastlines
-        rasters.
-    obs_threshold : int, optional
-        The minimum number of post-gapfilling Landsat observations
-        required for an extracted shoreline to be considered good
-        quality. Annual shorelines based on low numbers of
-        observations can be noisy due to the influence of
-        environmental noise like unmasked cloud, sea spray, white
-        water etc. Defaults to 5.
-    stdev_threshold : float, optional
-        The maximum MNDWI standard deviation required for a
-        post-gapfilled Landsat observation to be considered good
-        quality. Annual shorelines based on MNDWI with a high
-        standard deviation represent unstable data, which can
-        indicate that the tidal modelling process did not adequately
-        remove the influence of tide. For more information,
-        refer to BIshop-Taylor et al. 2021
-        (https://doi.org/10.1016/j.rse.2021.112734).
-        Defaults to 0.25.
-    sieve_size : int, optional
-        To reduce the complexity of the output masks, they are
-        first cleaned using `rasterio.features.sieve` to replace
-        small areas of pixels with the values of their larger
-        neighbours. This parameter sets the minimum polygon size
-        to retain in this process. Defaults to 128.
+    Pixels are classified as:
+      0 = good data
+      1 = unstable data (high water-index standard deviation)
+      2 = insufficient observations
 
-    Returns:
-    --------
-    vector_masks : dictionary of geopandas.GeoDataFrames
-        A dictionary with year (as an str) as the key, and vector
-        data as a `geopandas.GeoDataFrame` for each year in the
-        analysis.
+    The morphology is applied independently to each 2-D annual layer.  This
+    avoids dimensionality errors with modern xarray/scikit-image/rasterio
+    versions, where ``groupby("year")`` can retain a singleton year axis.
     """
 
-    # Identify problematic pixels
+    # Identify problematic pixels.
     high_stdev = yearly_ds["stdev"] > stdev_threshold
     low_obs = yearly_ds["count"] < obs_threshold
 
-    # Create raster mask with values of 0 for good data, values of
-    # 1 for unstable data, and values of 2 for insufficient data.
-    # Clean this by sieving to merge small areas of pixels into
-    # their neighbours
-    raster_mask = (
-        high_stdev.where(~low_obs, 2)
-        .groupby("year")
-        .apply(lambda x: sieve(x.values.astype(np.int16), size=sieve_size))
-    )
+    # 0 = good, 1 = unstable, 2 = insufficient observations.
+    raster_mask = high_stdev.where(~low_obs, 2).astype(np.int16)
 
-    # Apply greyscale dilation to expand masked pixels to err on
-    # the side of overclassifying certainty issues
-    raster_mask = raster_mask.groupby("year").apply(
-        lambda x: dilation(x.values, disk(3))
-    )
+    def _sieve_year(arr):
+        """Apply rasterio sieve to one 2-D annual layer."""
+        year_values = arr["year"].values if "year" in arr.dims else None
+        arr_2d = arr.squeeze("year", drop=True) if "year" in arr.dims else arr
 
-    # Loop through each mask and vectorise
+        sieved = sieve(arr_2d.values.astype(np.int16), size=sieve_size)
+        out = xr.DataArray(sieved, coords=arr_2d.coords, dims=arr_2d.dims)
+
+        if year_values is not None:
+            out = out.expand_dims(year=year_values)
+
+        return out
+
+    def _dilate_year(arr):
+        """Apply greyscale dilation to one 2-D annual layer."""
+        year_values = arr["year"].values if "year" in arr.dims else None
+        arr_2d = arr.squeeze("year", drop=True) if "year" in arr.dims else arr
+
+        dilated = dilation(arr_2d.values, footprint=disk(3))
+        out = xr.DataArray(dilated, coords=arr_2d.coords, dims=arr_2d.dims)
+
+        if year_values is not None:
+            out = out.expand_dims(year=year_values)
+
+        return out
+
+    # Clean each year independently.
+    raster_mask = raster_mask.groupby("year").map(_sieve_year)
+    raster_mask = raster_mask.groupby("year").map(_dilate_year)
+
+    # Obtain spatial metadata from rioxarray rather than the legacy ``geobox``
+    # attribute used by older xarray/datacube versions.
+    crs = yearly_ds.rio.crs
+    transform = yearly_ds.rio.transform()
+
+    if crs is None:
+        raise ValueError("Input raster dataset has no CRS available via rioxarray.")
+
+    # Loop through each annual mask and vectorise.
     vector_masks = {}
     for i, arr in raster_mask.groupby("year"):
+        arr = arr.squeeze("year", drop=True) if "year" in arr.dims else arr
+
         vector_mask = xr_vectorize(
             arr,
-            crs=yearly_ds.geobox.crs,
-            transform=yearly_ds.geobox.affine,
+            crs=crs,
+            transform=transform,
             attribute_col="certainty",
         )
 
-        # Dissolve column and fix geometry
+        # Dissolve classes and repair any invalid geometry.
         vector_mask = vector_mask.dissolve("certainty")
         vector_mask["geometry"] = vector_mask.geometry.buffer(0)
 
-        # Rename classes and add to dict
+        # Preserve original DE Africa class labels.
         vector_mask = vector_mask.rename(
             {0: "good", 1: "unstable data", 2: "insufficient data"}
         )
@@ -1386,23 +1401,23 @@ def generate_vectors(
             *array_bounds(
                 height=yearly_ds.sizes["y"],
                 width=yearly_ds.sizes["x"],
-                transform=yearly_ds.transform,
+                transform=yearly_ds.rio.transform(),
             )
         ),
-        crs=yearly_ds.crs,
+        crs=yearly_ds.rio.crs,
     )
 
     # Tide points
     tide_points_gdf = gpd.read_file(
         config["Input files"]["points_path"], bbox=bbox
-    ).to_crs(yearly_ds.crs)
+    ).to_crs(yearly_ds.rio.crs)
     log.info(f"Study area {study_area}: Loaded ocean points")
 
     # Study area polygon
     gridcell_gdf = (
         gpd.read_file(config["Input files"]["grid_path"], bbox=bbox)
         .set_index("id")
-        .to_crs(str(yearly_ds.crs))
+        .to_crs(str(yearly_ds.rio.crs))
     )
     gridcell_gdf.index = gridcell_gdf.index.astype(int).astype(str)
     gridcell_gdf = gridcell_gdf.loc[[str(study_area)]]
@@ -1410,17 +1425,17 @@ def generate_vectors(
     # Coastal mask modifications
     modifications_gdf = gpd.read_file(
         config["Input files"]["modifications_path"], bbox=bbox
-    ).to_crs(str(yearly_ds.crs))
+    ).to_crs(str(yearly_ds.rio.crs))
 
     # Geomorphology dataset
     geomorphology_gdf = gpd.read_file(
         config["Input files"]["geomorphology_path"], bbox=bbox
-    ).to_crs(str(yearly_ds.crs))
+    ).to_crs(str(yearly_ds.rio.crs))
 
     # Region attribute dataset
     region_gdf = gpd.read_file(
         config["Input files"]["region_attributes_path"], bbox=bbox
-    ).to_crs(str(yearly_ds.crs))
+    ).to_crs(str(yearly_ds.rio.crs))
 
     ##############################
     # Extract shoreline contours #
