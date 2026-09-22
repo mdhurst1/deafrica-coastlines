@@ -23,6 +23,7 @@ def load_water_index_stac(
     resolution=30,
     cloud_cover=80,
     platforms=None,
+    fail_on_error=True,
 ):
     """
     Load Landsat Collection 2 Level-2 imagery and calculate
@@ -54,10 +55,7 @@ def load_water_index_stac(
     if platforms is None:
         platforms = DEFAULT_PLATFORMS
 
-    catalog = pystac_client.Client.open(
-        PLANETARY_COMPUTER_STAC,
-        modifier=planetary_computer.sign_inplace,
-    )
+    catalog = pystac_client.Client.open(PLANETARY_COMPUTER_STAC)
 
     search = catalog.search(
         collections=["landsat-c2-l2"],
@@ -105,6 +103,8 @@ def load_water_index_stac(
             "x": 1024,
             "y": 1024,
         },
+        patch_url=planetary_computer.sign,
+        fail_on_error=fail_on_error,
     )
 
     # Collection 2 Level-2 surface-reflectance scaling

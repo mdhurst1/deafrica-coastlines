@@ -1,10 +1,13 @@
 from pathlib import Path
+import time
 
 import matplotlib.pyplot as plt
 import numpy as np
+import planetary_computer.sas as pc_sas
+import rasterio
 import xarray as xr
-from PIL import Image
 
+from PIL import Image
 from eo_tides.eo import pixel_tides
 
 from coastlines.stac import load_water_index_stac
@@ -37,22 +40,53 @@ platforms = [
 ]
 
 
+# ---------------------------------------------------------------------
 # Output folders
-output_dir = Path("outputs/montrose_animation")
-composite_dir = output_dir / "composites"
-frame_dir = output_dir / "frames"
+# ---------------------------------------------------------------------
 
-output_dir.mkdir(parents=True, exist_ok=True)
-composite_dir.mkdir(parents=True, exist_ok=True)
-frame_dir.mkdir(parents=True, exist_ok=True)
+output_dir = Path(
+    "outputs/montrose_animation"
+)
+
+composite_dir = (
+    output_dir / "composites"
+)
+
+frame_dir = (
+    output_dir / "frames"
+)
+
+output_dir.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+composite_dir.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+frame_dir.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
 
-# Animation output
-gif_file = output_dir / "montrose_mndwi_1988_2025.gif"
+gif_file = (
+    output_dir
+    / "montrose_mndwi_1988_2025.gif"
+)
 
-
-# Animation timing
 frame_duration_ms = 500
+
+
+# ---------------------------------------------------------------------
+# Remote-read retry settings
+# ---------------------------------------------------------------------
+
+max_attempts = 3
+
+retry_wait_seconds = 5
 
 
 # =====================================================================
@@ -60,13 +94,16 @@ frame_duration_ms = 500
 # =====================================================================
 
 if not cutoff_file.exists():
+
     raise FileNotFoundError(
         f"Could not find {cutoff_file}. "
         "Calculate the long-term tidal cutoffs first."
     )
 
+
 print(
-    f"Loading fixed tidal cutoffs from {cutoff_file}..."
+    f"Loading fixed tidal cutoffs "
+    f"from {cutoff_file}..."
 )
 
 cutoffs = xr.open_dataset(
@@ -83,10 +120,150 @@ tide_cutoff_max = cutoffs[
 
 
 # =====================================================================
+# HELPER FUNCTION
+# =====================================================================
+
+def load_and_filter_year(
+    year,
+    tides,
+    cutoff_min,
+    cutoff_max,
+):
+    """
+    Reload one year's Landsat imagery immediately before computation.
+
+    This ensures Planetary Computer URLs are freshly signed.
+
+    The first attempts fail loudly. On the final attempt, individual
+    unreadable remote assets are treated as nodata rather than causing
+    the entire multi-year animation job to fail.
+    """
+
+    for attempt in range(
+        1,
+        max_attempts + 1,
+    ):
+
+        print()
+        print(
+            f"Raster download attempt "
+            f"{attempt}/{max_attempts}"
+        )
+
+
+        # -------------------------------------------------------------
+        # Force Planetary Computer to obtain a fresh SAS token
+        # -------------------------------------------------------------
+
+        pc_sas.TOKEN_CACHE.clear()
+
+
+        # -------------------------------------------------------------
+        # On the final attempt, tolerate an individual failed COG
+        # -------------------------------------------------------------
+
+        fail_on_error = (
+            attempt < max_attempts
+        )
+
+        if fail_on_error:
+
+            print(
+                "Remote read mode: strict"
+            )
+
+        else:
+
+            print(
+                "Remote read mode: tolerate "
+                "individual unreadable assets"
+            )
+
+
+        # -------------------------------------------------------------
+        # Build a completely fresh Landsat load
+        # -------------------------------------------------------------
+
+        print(
+            "Reloading Landsat imagery "
+            "with fresh credentials..."
+        )
+
+        ds = load_water_index_stac(
+            bbox=bbox,
+            datetime=(
+                f"{year}-01-01/"
+                f"{year}-12-31"
+            ),
+            platforms=platforms,
+            fail_on_error=fail_on_error,
+        )
+
+
+        # -------------------------------------------------------------
+        # Make sure tide timestamps exactly match refreshed imagery
+        # -------------------------------------------------------------
+
+        tides_year = tides.sel(
+            time=ds.time
+        )
+
+        ds["tide_m"] = tides_year
+
+
+        # -------------------------------------------------------------
+        # Immediately trigger the raster reads
+        # -------------------------------------------------------------
+
+        try:
+
+            print(
+                "Applying long-term tidal filter..."
+            )
+
+            tidal_ds = load_tidal_subset(
+                year_ds=ds,
+                tide_cutoff_min=cutoff_min,
+                tide_cutoff_max=cutoff_max,
+            )
+
+            return tidal_ds
+
+
+        except (
+            rasterio.errors.RasterioIOError,
+            rasterio.errors.RasterBlockError,
+            rasterio.errors.WarpOperationError,
+        ) as error:
+
+            print()
+            print(
+                f"Remote raster read failed "
+                f"for {year}:"
+            )
+
+            print(error)
+
+            if attempt == max_attempts:
+
+                raise
+
+            print(
+                f"Waiting {retry_wait_seconds} "
+                "seconds before retrying..."
+            )
+
+            time.sleep(
+                retry_wait_seconds
+            )
+
+
+# =====================================================================
 # PROCESS EACH YEAR
 # =====================================================================
 
 frame_files = []
+
 
 for year in range(
     start_year,
@@ -95,8 +272,9 @@ for year in range(
 
     print()
     print("=" * 70)
-    print(f"Processing {year}")
+    print(f"PROCESSING {year}")
     print("=" * 70)
+
 
     composite_file = (
         composite_dir
@@ -109,9 +287,9 @@ for year in range(
     )
 
 
-    # -----------------------------------------------------------------
-    # Load existing annual composite if already processed
-    # -----------------------------------------------------------------
+    # =================================================================
+    # USE CACHED COMPOSITE WHEN AVAILABLE
+    # =================================================================
 
     if composite_file.exists():
 
@@ -124,19 +302,22 @@ for year in range(
             composite_file
         )
 
+
     else:
 
-        # -------------------------------------------------------------
-        # Load Landsat imagery for this year
-        # -------------------------------------------------------------
+        # =============================================================
+        # STEP 1
+        # Build lightweight Landsat dataset for timestamps / geometry
+        # =============================================================
 
         print(
-            f"Loading Landsat data for {year}..."
+            f"Finding Landsat observations "
+            f"for {year}..."
         )
 
         try:
 
-            ds = load_water_index_stac(
+            ds_meta = load_water_index_stac(
                 bbox=bbox,
                 datetime=(
                     f"{year}-01-01/"
@@ -154,31 +335,37 @@ for year in range(
             continue
 
 
+        n_observations = (
+            ds_meta.sizes["time"]
+        )
+
         print(
-            f"Found {ds.sizes['time']} "
-            f"Landsat observations."
+            f"Found {n_observations} "
+            "Landsat observations."
         )
 
 
-        # -------------------------------------------------------------
-        # Model tide heights for each Landsat observation
-        # -------------------------------------------------------------
+        # =============================================================
+        # STEP 2
+        # Model tides BEFORE downloading imagery
+        # =============================================================
 
         print(
             "Modelling pixel tides..."
         )
 
         tides = pixel_tides(
-            data=ds,
+            data=ds_meta,
             model="EOT20",
             directory=tide_model_dir,
             resample=True,
         )
 
 
-        # -------------------------------------------------------------
-        # Align fixed cutoffs to this year's grid
-        # -------------------------------------------------------------
+        # =============================================================
+        # STEP 3
+        # Align fixed 1984–2025 cutoff surfaces
+        # =============================================================
 
         cutoff_min = (
             tide_cutoff_min
@@ -197,25 +384,16 @@ for year in range(
         )
 
 
-        # -------------------------------------------------------------
-        # Attach tides using DEA Coastlines variable name
-        # -------------------------------------------------------------
+        # =============================================================
+        # STEP 4
+        # Reload Landsat with fresh signing and actually read pixels
+        # =============================================================
 
-        ds["tide_m"] = tides
-
-
-        # -------------------------------------------------------------
-        # Apply fixed 1984–2025 tidal filter
-        # -------------------------------------------------------------
-
-        print(
-            "Applying long-term tidal filter..."
-        )
-
-        tidal_ds = load_tidal_subset(
-            year_ds=ds,
-            tide_cutoff_min=cutoff_min,
-            tide_cutoff_max=cutoff_max,
+        tidal_ds = load_and_filter_year(
+            year=year,
+            tides=tides,
+            cutoff_min=cutoff_min,
+            cutoff_max=cutoff_max,
         )
 
 
@@ -231,14 +409,15 @@ for year in range(
 
         print(
             f"{tidal_ds.sizes['time']} "
-            f"observations remain after "
-            f"tidal filtering."
+            "observations remain after "
+            "tidal filtering."
         )
 
 
-        # -------------------------------------------------------------
-        # Generate annual DEA Coastlines composite
-        # -------------------------------------------------------------
+        # =============================================================
+        # STEP 5
+        # Generate annual composite
+        # =============================================================
 
         print(
             "Generating annual composite..."
@@ -252,28 +431,31 @@ for year in range(
             export_geotiff=False,
         )
 
+
         annual = composite.sel(
             year=year
         )
 
 
         # -------------------------------------------------------------
-        # Load into memory before closing remote resources
+        # Everything should now be local/in memory
         # -------------------------------------------------------------
 
         annual = annual.compute()
 
 
-        # -------------------------------------------------------------
-        # Save annual composite
-        # -------------------------------------------------------------
+        # =============================================================
+        # STEP 6
+        # Save composite to disk
+        # =============================================================
 
         annual.to_netcdf(
             composite_file
         )
 
         print(
-            f"Saved {composite_file}"
+            f"Saved composite: "
+            f"{composite_file}"
         )
 
 
@@ -282,23 +464,27 @@ for year in range(
     # =================================================================
 
     print(
-        f"Creating frame for {year}..."
+        f"Creating animation frame "
+        f"for {year}..."
     )
 
 
-    # Ensure data loaded if coming from cached NetCDF
-    mndwi = annual["mndwi"].load()
+    mndwi = annual[
+        "mndwi"
+    ].load()
 
 
-    # -------------------------------------------------------------
-    # Useful QA numbers to put on frame
-    # -------------------------------------------------------------
+    # -----------------------------------------------------------------
+    # QA number shown on frame
+    # -----------------------------------------------------------------
 
     if "count" in annual:
 
         mean_count = float(
             annual["count"]
-            .mean(skipna=True)
+            .mean(
+                skipna=True
+            )
             .values
         )
 
@@ -307,16 +493,16 @@ for year in range(
         mean_count = np.nan
 
 
-    # -------------------------------------------------------------
-    # Plot
-    # -------------------------------------------------------------
+    # -----------------------------------------------------------------
+    # Plot annual MNDWI
+    # -----------------------------------------------------------------
 
     fig, ax = plt.subplots(
         figsize=(10, 8)
     )
 
 
-    plot = mndwi.plot(
+    mndwi.plot(
         ax=ax,
         cmap="RdBu",
         vmin=-1,
@@ -330,19 +516,46 @@ for year in range(
 
     ax.set_title(
         f"Montrose Bay annual Landsat composite — {year}\n"
-        f"Tidally filtered median MNDWI",
+        "Tidally filtered median MNDWI",
         fontsize=14,
     )
 
 
-    # Small QA annotation
-    if np.isfinite(mean_count):
+    # -----------------------------------------------------------------
+    # Draw MNDWI = 0 candidate shoreline
+    # -----------------------------------------------------------------
+
+    try:
+
+        ax.contour(
+            mndwi.x,
+            mndwi.y,
+            mndwi.values,
+            levels=[0],
+            linewidths=1,
+        )
+
+    except Exception as error:
+
+        print(
+            f"Could not draw zero contour "
+            f"for {year}: {error}"
+        )
+
+
+    # -----------------------------------------------------------------
+    # QA annotation
+    # -----------------------------------------------------------------
+
+    if np.isfinite(
+        mean_count
+    ):
 
         ax.text(
             0.02,
             0.02,
             (
-                f"Mean valid observations: "
+                "Mean valid observations: "
                 f"{mean_count:.1f}"
             ),
             transform=ax.transAxes,
@@ -377,12 +590,26 @@ for year in range(
 
 
     print(
-        f"Saved {frame_file}"
+        f"Saved frame: "
+        f"{frame_file}"
     )
+
 
     frame_files.append(
         frame_file
     )
+
+
+    # -----------------------------------------------------------------
+    # Close cached xarray file handles
+    # -----------------------------------------------------------------
+
+    if hasattr(
+        annual,
+        "close",
+    ):
+
+        annual.close()
 
 
 # =====================================================================
@@ -398,18 +625,19 @@ if len(frame_files) == 0:
 
 print()
 print("=" * 70)
-print("Creating animation")
+print("CREATING GIF")
 print("=" * 70)
 
 
-# Ensure chronological order
 frame_files = sorted(
     frame_files
 )
 
 
 images = [
-    Image.open(frame).convert("RGB")
+    Image.open(
+        frame
+    ).convert("RGB")
     for frame in frame_files
 ]
 
@@ -424,16 +652,19 @@ images[0].save(
 
 
 for image in images:
+
     image.close()
 
 
 print()
 print(
-    f"Saved animation: {gif_file}"
+    f"Saved animation: "
+    f"{gif_file}"
 )
 
 print(
-    f"Frames included: {len(frame_files)}"
+    f"Frames included: "
+    f"{len(frame_files)}"
 )
 
 print(
@@ -441,4 +672,5 @@ print(
     f"{start_year}–{end_year}"
 )
 
-print("\nDone.")
+print()
+print("Done.")
