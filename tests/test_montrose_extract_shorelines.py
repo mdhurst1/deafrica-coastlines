@@ -2,7 +2,7 @@ from pathlib import Path
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
-from matplotlib import cm
+from matplotlib import cm, colormaps
 from matplotlib.colors import Normalize
 from matplotlib.patches import Rectangle
 import numpy as np
@@ -373,7 +373,12 @@ shorelines_plot = contours_gdf.reset_index().copy()
 #   after inspecting the first output.
 # ---------------------------------------------------------------------
 
-zoom_bounds = None
+zoom_bounds = (
+    534000,
+    534500,
+    6286650,
+    6288100,
+)
 
 # Example manual override (replace with your own values if wanted):
 # zoom_bounds = (
@@ -435,7 +440,7 @@ norm = Normalize(
     vmax=max(years),
 )
 
-cmap = cm.get_cmap("magma")
+cmap = colormaps["magma"]
 
 # ---------------------------------------------------------------------
 # Make figure
