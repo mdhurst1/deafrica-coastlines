@@ -184,7 +184,8 @@ example_ds = load_water_index_stac(
 )
 
 print(example_ds)
-
+print(example_ds.sun_elevation)
+print(example_ds.sun_azimuth)
 
 # ---------------------------------------------------------------------
 # Compute and plot MNDWI for the example scene
