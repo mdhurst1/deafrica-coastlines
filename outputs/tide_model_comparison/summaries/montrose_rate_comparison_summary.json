@@ -1,0 +1,15 @@
+{
+  "n_common_points": 327,
+  "n_valid_rate_pairs": 327,
+  "median_rate_eot20_m_per_yr": -0.121,
+  "median_rate_fes2022_m_per_yr": -0.113,
+  "median_delta_fes_minus_eot_m_per_yr": -0.010000000000000009,
+  "median_absolute_delta_m_per_yr": 0.030000000000000027,
+  "mean_absolute_delta_m_per_yr": 0.05391743119266055,
+  "rmse_rate_difference_m_per_yr": 0.08607956279802118,
+  "delta_p10_m_per_yr": -0.06040000000000001,
+  "delta_p90_m_per_yr": 0.10360000000000005,
+  "rate_correlation_r": 0.9959470861503551,
+  "sign_agreement_percent": 97.55351681957187,
+  "sign_flip_percent": 2.4464831804281344
+}

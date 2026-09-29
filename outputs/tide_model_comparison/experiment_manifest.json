@@ -1,0 +1,36 @@
+{
+  "study_area": "montrose",
+  "bbox": [
+    -2.52,
+    56.7,
+    -2.42,
+    56.76
+  ],
+  "analysis_years": [
+    1988,
+    2025
+  ],
+  "cutoff_years": [
+    1984,
+    2025
+  ],
+  "baseline_year": 2020,
+  "point_spacing_m": 30,
+  "water_index": "mndwi",
+  "index_threshold": 0.0,
+  "tide_model_dir": "/home/mh322u/tide_models_scotland",
+  "models": {
+    "EOT20": {
+      "raster_version": "scotland_v0.1",
+      "cache_root": "outputs/montrose_dea_cache",
+      "cutoff_file": "montrose_tidal_cutoffs_1984_2025.nc",
+      "shoreline_file": "outputs/tide_model_comparison/shorelines/montrose_EOT20_DEA_MSL_1988_2025.geojson"
+    },
+    "FES2022": {
+      "raster_version": "scotland_fes2022_v0.1",
+      "cache_root": "outputs/montrose_dea_cache/FES2022",
+      "cutoff_file": "outputs/tide_model_comparison/cutoffs/montrose_FES2022_cutoffs_1984_2025.nc",
+      "shoreline_file": "outputs/tide_model_comparison/shorelines/montrose_FES2022_DEA_MSL_1988_2025.geojson"
+    }
+  }
+}
