@@ -273,19 +273,19 @@ def load_water_index_stac(
 
     if mask_terrain_shadow:
 
-    if dem is None:
-        raise ValueError(
-            "A DEM must be supplied when "
-            "mask_terrain_shadow=True"
+        if dem is None:
+            raise ValueError(
+                "A DEM must be supplied when "
+                "mask_terrain_shadow=True"
+            )
+
+        out = terrain_shadow_masking_stac(
+            ds=out,
+            dem=dem,
+            threshold=terrain_shadow_threshold,
+            radius=terrain_shadow_radius,
         )
 
-    out = terrain_shadow_masking_stac(
-        ds=out,
-        dem=dem,
-        threshold=terrain_shadow_threshold,
-        radius=terrain_shadow_radius,
-    )
-    
     return out
 
 def load_dem_stac(
