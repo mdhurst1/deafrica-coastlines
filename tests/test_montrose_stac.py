@@ -262,31 +262,92 @@ print(f"  Shadowed area: {shadow_percent:.2f}%")
 
 print("\nComputing example MNDWI...")
 
-example = (
+example_unmasked = (
+    example_ds_unmasked
+    .mndwi
+    .isel(time=0)
+    .compute()
+)
+
+example_masked = (
     example_ds
     .mndwi
     .isel(time=0)
     .compute()
 )
 
-plt.figure(figsize=(8, 8))
+shadow = (
+    example_ds
+    .terrain_shadow
+    .isel(time=0)
+    .compute()
+)
 
-example.plot(
+valid_before = np.isfinite(
+    example_unmasked.values
+)
+
+valid_after = np.isfinite(
+    example_masked.values
+)
+
+newly_masked = (
+    valid_before
+    & ~valid_after
+)
+
+print(
+    "Valid MNDWI pixels removed by terrain shadow:",
+    int(newly_masked.sum()),
+)
+
+fig, axes = plt.subplots(
+    1,
+    3,
+    figsize=(18, 7),
+)
+
+example_unmasked.plot(
+    ax=axes[0],
     vmin=-1,
     vmax=1,
     cmap="RdBu",
 )
 
-plt.title(
-    f"Montrose MNDWI\n"
-    f"{best_date} — {best_platform} "
-    f"({best_cloud:.1f}% scene cloud)"
+axes[0].set_title(
+    "MNDWI - no terrain-shadow mask"
+)
+
+shadow.plot(
+    ax=axes[1],
+    cmap="gray",
+    add_colorbar=False,
+)
+
+axes[1].set_title(
+    "Terrain-shadow mask"
+)
+
+example_masked.plot(
+    ax=axes[2],
+    vmin=-1,
+    vmax=1,
+    cmap="RdBu",
+)
+
+axes[2].set_title(
+    "MNDWI - terrain-shadow masked"
+)
+
+fig.suptitle(
+    f"Montrose terrain-shadow test\n"
+    f"{best_date} - {best_platform}"
 )
 
 plt.tight_layout()
 
 plt.savefig(
-    "montrose_mndwi_example.png",
+    "montrose_terrain_shadow_test.png",
     dpi=150,
     bbox_inches="tight",
 )
@@ -294,10 +355,5 @@ plt.savefig(
 plt.close()
 
 print("Saved montrose_mndwi_example.png")
-
-
-# ---------------------------------------------------------------------
-# Finished
-# ---------------------------------------------------------------------
 
 print("\nDone.")

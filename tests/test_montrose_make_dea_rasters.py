@@ -9,7 +9,10 @@ import xarray as xr
 
 from eo_tides.eo import pixel_tides
 
-from coastlines.stac import load_water_index_stac
+from coastlines.stac import (
+    load_water_index_stac,
+    load_dem_stac,
+)
 from coastlines.raster import (
     load_tidal_subset,
     tidal_composite,
@@ -23,8 +26,8 @@ from coastlines.raster import (
 bbox = [-2.52, 56.70, -2.42, 56.76]
 
 # Final annual products required
-start_year = 1988
-end_year = 2025
+start_year = 1995
+end_year = 1995
 
 # DEA three-year gapfill requires:
 #
@@ -49,6 +52,10 @@ platforms = [
     "landsat-9",
 ]
 
+# Terrain-shadow masking
+mask_terrain_shadow = True
+terrain_shadow_threshold = 0.5
+terrain_shadow_radius = 1
 
 # =====================================================================
 # DEA-STYLE OUTPUT STRUCTURE
@@ -58,7 +65,7 @@ raster_root = Path(
     "outputs/dea_rasters"
 )
 
-raster_version = "scotland_v0.1"
+raster_version = "scotland_v0.2_shadow"
 
 study_area = "montrose"
 
@@ -89,7 +96,7 @@ tide_cache_dir = (
 )
 
 observation_cache_dir = (
-    cache_root / "tidal_observations"
+    cache_root / "tidal_observations_shadow"
 )
 
 
@@ -103,6 +110,23 @@ observation_cache_dir.mkdir(
     exist_ok=True,
 )
 
+# =====================================================================
+# LOAD COPERNICUS DEM FOR TERRAIN-SHADOW MASKING
+# =====================================================================
+
+print()
+print("Loading Copernicus DEM...")
+
+dem = load_dem_stac(
+    bbox=bbox,
+    output_crs="EPSG:32630",
+    resolution=30,
+)
+
+print(
+    f"DEM loaded: "
+    f"{dem.sizes['y']} x {dem.sizes['x']} pixels"
+)
 
 # =====================================================================
 # RETRY SETTINGS FOR PLANETARY COMPUTER
@@ -178,6 +202,7 @@ print(
 def stac_load_year(
     year,
     fail_on_error=True,
+    apply_terrain_shadow=False,
 ):
     """
     Create a lazy Landsat dataset for one year.
@@ -191,6 +216,18 @@ def stac_load_year(
         ),
         "platforms": platforms,
     }
+
+    if apply_terrain_shadow:
+        kwargs.update(
+            {
+                "dem": dem,
+                "mask_terrain_shadow": mask_terrain_shadow,
+                "terrain_shadow_threshold":
+                    terrain_shadow_threshold,
+                "terrain_shadow_radius":
+                    terrain_shadow_radius,
+            }
+        )
 
 
     if supports_fail_on_error:
@@ -471,6 +508,11 @@ def build_filtered_observations(
                 "tide_m",
             }
 
+            if mask_terrain_shadow:
+                required_variables.add(
+                    "terrain_shadow"
+                )
+
             available_variables = set(
                 cached.data_vars
             )
@@ -564,59 +606,29 @@ def build_filtered_observations(
             # Fresh STAC load immediately before reading pixels
             # -----------------------------------------------------
 
-            ds = stac_load_year(
-                year,
-                fail_on_error=strict,
-            )
-
+            ds = stac_load_year(year, fail_on_error=strict, apply_terrain_shadow=True)
 
             print(
                 f"{year}: fresh Landsat stack contains "
                 f"{ds.sizes['time']} observations"
             )
 
-
-            # -----------------------------------------------------
             # If STAC has changed since tide cache was built,
             # regenerate tides
-            # -----------------------------------------------------
+            if not tide_times_match(tides, ds):
+                tides = regenerate_tides(year=year, ds=ds)
 
-            if not tide_times_match(
-                tides,
-                ds,
-            ):
-
-                tides = regenerate_tides(
-                    year=year,
-                    ds=ds,
-                )
-
-
-            # -----------------------------------------------------
             # Match tide timestamps exactly to Landsat
-            # -----------------------------------------------------
+            tides_year = tides.sel(time=ds.time)
 
-            tides_year = tides.sel(
-                time=ds.time
-            )
-
-
-            # -----------------------------------------------------
             # Only retain variables needed by DEA raster workflow
-            # -----------------------------------------------------
+            variables_to_keep = ["mndwi", "ndwi",]
 
-            ds = ds[
-                [
-                    "mndwi",
-                    "ndwi",
-                ]
-            ]
+            if "terrain_shadow" in ds:
+                variables_to_keep.append("terrain_shadow")
 
-
-            ds[
-                "tide_m"
-            ] = tides_year
-
+            ds = ds[variables_to_keep]
+            ds["tide_m"] = tides_year
 
             # -----------------------------------------------------
             # Align fixed long-term cutoff grids
