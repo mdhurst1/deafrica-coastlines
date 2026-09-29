@@ -1,4 +1,7 @@
-from coastlines.stac import load_water_index_stac
+from coastlines.stac import (
+    load_water_index_stac,
+    load_dem_stac,
+)
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -22,6 +25,20 @@ platforms = [
     "landsat-9",
 ]
 
+# ---------------------------------------------------------------------
+# Load Copernicus DEM for terrain-shadow masking
+# ---------------------------------------------------------------------
+
+print("Loading Copernicus DEM...")
+
+dem = load_dem_stac(
+    bbox=bbox,
+    output_crs="EPSG:32630",
+    resolution=30,
+)
+
+print("\nDEM:")
+print(dem)
 
 # ---------------------------------------------------------------------
 # Load full Landsat archive lazily
@@ -174,18 +191,70 @@ print(f"  Scene cloud cover: {best_cloud:.1f}%")
 # downloading the example image.
 # ---------------------------------------------------------------------
 
-print("\nLoading example image...")
+print("\nLoading example image WITHOUT terrain-shadow masking...")
 
-example_ds = load_water_index_stac(
+example_ds_unmasked = load_water_index_stac(
     bbox=bbox,
     datetime=f"{best_date}/{best_date}",
     platforms=[best_platform],
     cloud_cover=100,
 )
 
+
+print("\nLoading example image WITH terrain-shadow masking...")
+
+example_ds = load_water_index_stac(
+    bbox=bbox,
+    datetime=f"{best_date}/{best_date}",
+    platforms=[best_platform],
+    cloud_cover=100,
+    dem=dem,
+    mask_terrain_shadow=True,
+    terrain_shadow_threshold=0.5,
+    terrain_shadow_radius=1,
+)
+
+print("\nShadow-masked dataset:")
 print(example_ds)
-print(example_ds.sun_elevation)
-print(example_ds.sun_azimuth)
+
+# ---------------------------------------------------------------------
+# Terrain-shadow diagnostics
+# ---------------------------------------------------------------------
+
+print("\nSolar geometry:")
+
+print(
+    "  Sun elevation:",
+    example_ds.sun_elevation.values,
+)
+
+print(
+    "  Sun azimuth:",
+    example_ds.sun_azimuth.values,
+)
+
+
+shadow = (
+    example_ds
+    .terrain_shadow
+    .isel(time=0)
+    .compute()
+)
+
+shadow_pixels = int(
+    shadow.sum().values
+)
+
+total_pixels = shadow.size
+
+shadow_percent = (
+    100.0 * shadow_pixels / total_pixels
+)
+
+print("\nTerrain-shadow mask:")
+print(f"  Shadow pixels: {shadow_pixels}")
+print(f"  Total pixels: {total_pixels}")
+print(f"  Shadowed area: {shadow_percent:.2f}%")
 
 # ---------------------------------------------------------------------
 # Compute and plot MNDWI for the example scene
