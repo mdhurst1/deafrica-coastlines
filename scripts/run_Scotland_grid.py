@@ -70,23 +70,22 @@ from coastlines.vector import (
 # USER SETTINGS
 # =============================================================================
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+# folders
+HOME_FOLDER = Path("/media/nevis_array/user_homes/mhurst/")
+RESULTS_FOLDER = HOME_FOLDER / "scotland_dea_results"
+TIDE_MODEL_DIR = HOME_FOLDER / "tide_models"
 
 # Copy the 20 km core grid into the repository data folder.
-GRID_FILE = REPO_ROOT / "data" / "Scotland_DEA_20km_core_tiles.geojson"
-
+GRID_FILE = HOME_FOLDER / "Scotland_DEA_20km_core_tiles.geojson"
 TILE_ID_FIELD = "tile_id"
 TILE_NO_FIELD = "tile_no"
 
 # Default regional upscale pilot. Set to None to make all tiles the default,
 # or keep this list and use --all when ready for the national run.
-PILOT_TILE_NOS = [17, 18, 22, 23, 28, 34, 35, 43, 44, 54, 46]
+PILOT_TILE_NOS = [17, 18, 22, 23, 28, 34, 35, 43, 44, 45, 46]
 
 # Processing context around every 20 km core tile.
 PROCESSING_BUFFER_M = 5000
-
-# Tide model installation.
-TIDE_MODEL_DIR = Path("/home/mh322u/tide_models")
 
 
 # =============================================================================
@@ -131,12 +130,10 @@ VECTOR_VERSION = "scotland_grid_v0.1_bng_shadow"
 
 # Change RESULTS_ROOT to a mounted large drive before national production if
 # desired, e.g. Path("/path/to/large_drive/dea_scotland").
-RESULTS_ROOT = REPO_ROOT / "outputs"
-
-RASTER_ROOT = RESULTS_ROOT / "dea_rasters"
-VECTOR_ROOT = RESULTS_ROOT / "dea_vectors"
-CACHE_ROOT = RESULTS_ROOT / "dea_cache"
-LOG_ROOT = RESULTS_ROOT / "run_logs"
+RASTER_ROOT = RESULTS_FOLDER / "dea_rasters"
+VECTOR_ROOT = RESULTS_FOLDER / "dea_vectors"
+CACHE_ROOT = RESULTS_FOLDER / "dea_cache"
+LOG_ROOT = RESULTS_FOLDER / "run_logs"
 
 
 # =============================================================================
@@ -1249,23 +1246,35 @@ def main():
                 }
             )
 
-    # Persistent batch summary for pilot/national QA.
-    LOG_ROOT.mkdir(parents=True, exist_ok=True)
-
-    run_label = "national" if args.all else "selected"
-
-    summary_file = (
+    # Write one independent status CSV per tile.
+    # This is safe when multiple tile-processing scripts run in parallel.
+    status_dir = (
         LOG_ROOT
-        / (
-            f"grid_run_{run_label}_{RASTER_VERSION}_"
-            f"{VECTOR_VERSION}.csv"
-        )
+        / RASTER_VERSION
+        / VECTOR_VERSION
+        / "tiles"
     )
 
-    pd.DataFrame(results).to_csv(
-        summary_file,
-        index=False,
+    status_dir.mkdir(
+        parents=True,
+        exist_ok=True,
     )
+
+    for result in results:
+
+        tile_id = result["tile_id"]
+
+        status_file = (
+            status_dir
+            / f"{tile_id}.csv"
+        )
+
+        pd.DataFrame(
+            [result]
+        ).to_csv(
+            status_file,
+            index=False,
+        )
 
     completed = sum(
         result["status"] in {"completed", "already_complete"}
@@ -1283,7 +1292,7 @@ def main():
     print("=" * 78)
     print(f"Successful/already complete: {completed}")
     print(f"Failed:                      {failed}")
-    print(f"Run summary:                 {summary_file}")
+    print(f"Per-tile status directory:   {status_dir}")
 
     if failed:
         print()
