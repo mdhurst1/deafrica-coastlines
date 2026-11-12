@@ -99,7 +99,7 @@ RESOLUTION = 30
 START_YEAR, END_YEAR = 1988, 2025
 CUTOFF_START, CUTOFF_END = 1984, 2025
 
-TIDE_MODEL = "EOT20"
+TIDE_MODEL = "FES2022_extrapolated"
 PLATFORMS = ["landsat-5", "landsat-7", "landsat-8", "landsat-9"]
 CLOUD_COVER = 80
 
@@ -108,6 +108,13 @@ SHADOW_RADIUS = 1
 
 WATER_INDEX = "mndwi"
 INDEX_THRESHOLD = 0.0
+
+# testing change of closing pixels for tile 45 (Firth of Clyde) to reduce spurious inland water connections in the estuary.
+COASTAL_CLOSING_DEFAULT = 15
+
+COASTAL_CLOSING_OVERRIDES = {
+    45: 10,
+}
 
 # Pilot QA: export diagnostic masks without changing the shoreline method.
 EXPORT_MASK_DIAGNOSTICS = True
@@ -484,11 +491,26 @@ def write_mask_geotiff(mask, path, reference):
     else:
         out = out.fillna(0).astype("uint8")
 
-    out = out.rio.write_crs(reference.rio.crs, inplace=False)
-    out.rio.write_transform(reference.rio.transform(), inplace=True)
+    # Remove inherited raster profile metadata so GDAL does not
+    # interpret WIDTH, HEIGHT, CRS, TRANSFORM etc. as creation options.
+    out = out.copy()
+    out.attrs = {}
+    out.encoding = {}
+
+    # Re-attach only the spatial information we actually need.
+    out = out.rio.write_crs(
+        reference.rio.crs,
+        inplace=False,
+    )
+
+    out.rio.write_transform(
+        reference.rio.transform(),
+        inplace=True,
+    )
 
     out.rio.to_raster(
         path,
+        driver="GTiff",
         dtype="uint8",
         compress="deflate",
     )
@@ -747,6 +769,13 @@ def run_tile(row, fresh=False):
     tile_id = str(row[TILE_ID_FIELD])
     tile_no = int(row[TILE_NO_FIELD])
 
+    # Use the DEA default closing distance unless a tile-specific
+    # override has been defined.
+    coastal_closing_pixels = COASTAL_CLOSING_OVERRIDES.get(
+        tile_no,
+        COASTAL_CLOSING_DEFAULT,
+    )
+    
     core_geometry = row.geometry
     process_geometry = processing_footprint(core_geometry)
     bbox = wgs84_bbox(process_geometry)
@@ -1068,6 +1097,7 @@ def run_tile(row, fresh=False):
         index_threshold=INDEX_THRESHOLD,
         tide_points_gdf=seeds,
         buffer_pixels=33,
+        coastal_closing_pixels=coastal_closing_pixels,
         mask_landcover=False,
         mask_ndwi=True,
         mask_temporal=True,

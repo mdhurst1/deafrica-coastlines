@@ -413,6 +413,7 @@ def contours_preprocess(
     index_threshold,
     tide_points_gdf,
     buffer_pixels=33,
+    coastal_closing_pixels=15,
     mask_landcover=True,
     mask_ndwi=True,
     mask_temporal=True,
@@ -575,8 +576,7 @@ def contours_preprocess(
     # them from the analysis
     all_time = thresholded_ds.mean(dim="year") >= 0.15
     coastal_mask = coastal_masking(
-        ds=all_time, tide_points_gdf=tide_points_gdf, buffer=buffer_pixels, closing=15
-    )
+        ds=all_time, tide_points_gdf=tide_points_gdf, buffer=buffer_pixels, closing=coastal_closing_pixels)
 
     # Optionally modify the coastal mask using manually supplied polygons to
     # add missing areas of shoreline, or remove unwanted areas from the mask.
