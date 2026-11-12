@@ -33,6 +33,15 @@ Debug one or more tiles:
 
 Full national grid:
     python -u scripts/run_scotland_grid_shorelines.py --all
+
+Pilot extraction + DEA change analysis + merged products:
+    python -u scripts/run_scotland_grid_shorelines.py --analyse
+
+National analysis after tile extraction is complete:
+    python -u scripts/run_scotland_grid_shorelines.py --all --analyse
+
+For parallel national extraction, run workers WITHOUT --analyse, then run a
+single --all --analyse pass afterwards to create the merged national products.
 """
 
 from __future__ import annotations
@@ -52,16 +61,21 @@ import xarray as xr
 from dea_tools.spatial import subpixel_contours
 from eo_tides.eo import pixel_tides
 from shapely.geometry import Point, box
+from shapely.ops import unary_union
 from skimage.morphology import binary_closing, disk
 
 from coastlines.raster import load_tidal_subset, tidal_composite, tide_cutoffs
 from coastlines.stac import load_dem_stac, load_water_index_stac
 from coastlines.vector import (
+    all_time_stats,
+    annual_movements,
+    calculate_regressions,
     coastal_masking,
     contour_certainty,
     contours_preprocess,
     load_rasters,
     ocean_masking,
+    points_on_line,
     temporal_masking,
 )
 
@@ -109,17 +123,27 @@ SHADOW_RADIUS = 1
 WATER_INDEX = "mndwi"
 INDEX_THRESHOLD = 0.0
 
-# testing change of closing pixels for tile 45 (Firth of Clyde) to reduce spurious inland water connections in the estuary.
-COASTAL_CLOSING_DEFAULT = 15
+# Scotland default. A 5-pixel (~150 m) morphological closing retains narrow
+# marine/estuarine connections better than the original DEA default of 15.
+COASTAL_CLOSING_DEFAULT = 5
 
+# Keep this dictionary for genuine local exceptions discovered during QA.
 COASTAL_CLOSING_OVERRIDES = {
-    45: 10,
 }
 
 # Pilot QA: export diagnostic masks without changing the shoreline method.
 EXPORT_MASK_DIAGNOSTICS = True
 DIAGNOSTIC_YEAR = 2020
 
+
+##
+# ANALYTICAL SETTINGS
+##
+
+BASELINE_YEAR = 2024
+POINT_SPACING_M = 30
+ANALYSIS_CONTEXT_M = 5000
+MAX_VALID_DIST_M = 5000
 
 # =============================================================================
 # VERSIONING
@@ -128,7 +152,7 @@ DIAGNOSTIC_YEAR = 2020
 # Keep this pilot distinct from the earlier AOI versions. If the regional pilot
 # leads to methodological changes, increment this before the national run.
 RASTER_VERSION = "scotland_grid_v0.1_bng_shadow"
-VECTOR_VERSION = "scotland_grid_v0.1_bng_shadow"
+VECTOR_VERSION = "scotland_grid_v0.2_closing5"
 
 
 # =============================================================================
@@ -141,6 +165,7 @@ RASTER_ROOT = RESULTS_FOLDER / "dea_rasters"
 VECTOR_ROOT = RESULTS_FOLDER / "dea_vectors"
 CACHE_ROOT = RESULTS_FOLDER / "dea_cache"
 LOG_ROOT = RESULTS_FOLDER / "run_logs"
+ANALYSIS_ROOT = RESULTS_FOLDER / "dea_analysis"
 
 
 # =============================================================================
@@ -174,6 +199,17 @@ def parse_args():
         help=(
             "Delete cache, raster and vector products for the selected tiles "
             "for the CURRENT versions before rerunning."
+        ),
+    )
+
+    parser.add_argument(
+        "--analyse",
+        action="store_true",
+        help=(
+            "Generate/reuse per-tile DEA baseline-point change analysis, then "
+            "merge completed shoreline and rate outputs for the current selection. "
+            "For national parallel processing, use disjoint --tiles selections "
+            "and finish with one --all --analyse pass."
         ),
     )
 
@@ -523,6 +559,7 @@ def export_mask_diagnostics(
     output_dir,
     tile_id,
     tile_no,
+    coastal_closing_pixels,
 ):
     """Reconstruct and export the masks used by contours_preprocess.
 
@@ -532,7 +569,7 @@ def export_mask_diagnostics(
         mask_ndwi=True
         mask_temporal=True
         buffer_pixels=33
-        morphological closing=15 pixels
+        morphological closing=coastal_closing_pixels
 
     The production shoreline mask still comes from contours_preprocess.
     These products are QA diagnostics only.
@@ -598,11 +635,11 @@ def export_mask_diagnostics(
         thresholded_ds.mean(dim="year") >= 0.15
     )
 
-    # Show the connected ocean after DEA's 15-pixel (~450 m) closing.
+    # Show the connected ocean after the active Scotland closing distance.
     closed_land = xr.apply_ufunc(
         lambda arr: binary_closing(
             arr,
-            footprint=disk(15),
+            footprint=disk(coastal_closing_pixels),
         ),
         all_time_land,
     )
@@ -620,7 +657,7 @@ def export_mask_diagnostics(
         ds=all_time_land,
         tide_points_gdf=tide_points_gdf,
         buffer=33,
-        closing=15,
+        closing=coastal_closing_pixels,
     )
 
     inland_mask = coastal_class == 2
@@ -742,8 +779,8 @@ def export_mask_diagnostics(
                     final_valid_mask.mean().values
                 ),
                 "n_pixels": total_pixels,
-                "closing_pixels": 15,
-                "closing_metres_nominal": 15 * RESOLUTION,
+                "closing_pixels": coastal_closing_pixels,
+                "closing_metres_nominal": coastal_closing_pixels * RESOLUTION,
                 "coastal_buffer_pixels": 33,
                 "coastal_buffer_metres_nominal": 33 * RESOLUTION,
             }
@@ -758,13 +795,594 @@ def export_mask_diagnostics(
     print(f"Mask diagnostics written to: {output_dir}")
 
 
+
+# =============================================================================
+# DEA CHANGE ANALYSIS + MERGED PRODUCTS
+# =============================================================================
+
+
+def rate_output_paths(tile_id):
+    """Return per-tile DEA change-analysis output paths."""
+    _, _, vector_dir = versioned_paths(tile_id)
+
+    stem = (
+        f"ratesofchange_{tile_id}_{VECTOR_VERSION}_"
+        f"{WATER_INDEX}_{INDEX_THRESHOLD:.2f}_baseline{BASELINE_YEAR}"
+    )
+
+    return (
+        vector_dir / f"{stem}_BNG.gpkg",
+        vector_dir / f"{stem}.geojson",
+    )
+
+
+def analyse_tile_rates(
+    contours,
+    yearly_ds,
+    core_geometry,
+    tile_id,
+    tile_no,
+    vector_dir,
+):
+    """Run DEA's native baseline-point analysis for one buffered tile.
+
+    The annual shoreline contours and water-index rasters are the buffered
+    processing products, so points near a 20 km core boundary retain the same
+    surrounding context used during shoreline extraction. Analysis points are
+    clipped back to the authoritative core only after all annual distances have
+    been calculated.
+
+    The calculation itself uses DEA Coastlines' native:
+        points_on_line()
+        annual_movements()
+        calculate_regressions()
+        all_time_stats()
+    """
+    output_gpkg, output_geojson = rate_output_paths(tile_id)
+
+    if output_gpkg.exists() and output_geojson.exists():
+        print(f"Rate analysis already complete: {output_geojson}")
+        return gpd.read_file(output_gpkg).to_crs(CRS)
+
+    analysis_contours = contours.copy()
+    analysis_contours.index = analysis_contours.index.astype(str)
+    analysis_contours.index.name = "year"
+
+    baseline_key = str(BASELINE_YEAR)
+
+    if baseline_key not in analysis_contours.index:
+        print(
+            f"No {BASELINE_YEAR} baseline shoreline for {tile_id}; "
+            "skipping rate analysis."
+        )
+        return None
+
+    print(
+        f"Running DEA change analysis using {BASELINE_YEAR} baseline "
+        f"and {POINT_SPACING_M} m points..."
+    )
+
+    try:
+        points = points_on_line(
+            analysis_contours,
+            baseline_key,
+            distance=POINT_SPACING_M,
+        )
+    except KeyError:
+        print(
+            f"Unable to generate baseline points for {tile_id}; "
+            "skipping rate analysis."
+        )
+        return None
+
+    if points is None or points.empty:
+        print(f"No baseline points generated for {tile_id}; skipping.")
+        return None
+
+    points = annual_movements(
+        points_gdf=points,
+        contours_gdf=analysis_contours,
+        yearly_ds=yearly_ds,
+        baseline_year=baseline_key,
+        water_index=WATER_INDEX,
+        max_valid_dist=MAX_VALID_DIST_M,
+    )
+
+    points = calculate_regressions(
+        points,
+        analysis_contours,
+    )
+
+    stats_fields = [
+        "valid_obs",
+        "valid_span",
+        "sce",
+        "nsm",
+        "max_year",
+        "min_year",
+    ]
+
+    points[stats_fields] = points.apply(
+        lambda row: all_time_stats(
+            row,
+            initial_year=START_YEAR,
+        ),
+        axis=1,
+    )
+
+    # Retain DEA's portable quality checks. The Africa-specific offshore-island
+    # and geomorphology flags are deliberately not applied here.
+    points["certainty"] = "good"
+    points.loc[
+        points["rate_time"].abs() > 200,
+        "certainty",
+    ] = "extreme value (> 200 m)"
+    points.loc[
+        points["angle_std"] > 30,
+        "certainty",
+    ] = "high angular variability"
+    points.loc[
+        points["valid_obs"] < 15,
+        "certainty",
+    ] = "insufficient observations"
+
+    # Authoritative ownership: only points inside this 20 km core are exported.
+    points = points[
+        points.geometry.intersects(core_geometry)
+    ].copy()
+
+    if points.empty:
+        print(
+            f"No {BASELINE_YEAR} analysis points remain inside "
+            f"core tile {tile_id}."
+        )
+        return None
+
+    points = points.reset_index(drop=True)
+
+    points["tile_no"] = tile_no
+    points["tile_id"] = tile_id
+    points["indicator"] = "DEA_MSL"
+    points["baseline_year"] = BASELINE_YEAR
+    points["point_spacing_m"] = POINT_SPACING_M
+    points["water_index"] = WATER_INDEX
+    points["threshold"] = INDEX_THRESHOLD
+    points["tide_model"] = TIDE_MODEL
+    points["tide_datum"] = "model MSL"
+    points["processing_buffer_m"] = PROCESSING_BUFFER_M
+    points["coastal_closing_pixels"] = COASTAL_CLOSING_OVERRIDES.get(
+        tile_no,
+        COASTAL_CLOSING_DEFAULT,
+    )
+    points["raster_version"] = RASTER_VERSION
+    points["vector_version"] = VECTOR_VERSION
+
+    points["point_no"] = np.arange(1, len(points) + 1)
+
+    points["point_id"] = (
+        points["tile_id"].astype(str)
+        + "_P"
+        + points["point_no"].astype(str).str.zfill(5)
+    )
+
+    # Put identifiers and headline statistics first while retaining all
+    # dist_YYYY fields required by CoastalMappingViewer timeseries popups.
+    preferred = [
+        "point_id",
+        "tile_no",
+        "tile_id",
+        "point_no",
+        "indicator",
+        "baseline_year",
+        "point_spacing_m",
+        "rate_time",
+        "sig_time",
+        "se_time",
+        "valid_obs",
+        "valid_span",
+        "sce",
+        "nsm",
+        "max_year",
+        "min_year",
+        "angle_mean",
+        "angle_std",
+        "certainty",
+        "water_index",
+        "threshold",
+        "tide_model",
+        "tide_datum",
+        "processing_buffer_m",
+        "coastal_closing_pixels",
+        "raster_version",
+        "vector_version",
+    ]
+
+    dist_fields = sorted(
+        [
+            column
+            for column in points.columns
+            if column.startswith("dist_")
+        ],
+        key=lambda name: int(name.split("_", 1)[1]),
+    )
+
+    ordered = (
+        [column for column in preferred if column in points.columns]
+        + dist_fields
+        + ["geometry"]
+    )
+
+    points = points[ordered]
+
+    vector_dir.mkdir(parents=True, exist_ok=True)
+
+    points.to_file(
+        output_gpkg,
+        layer="rates_of_change",
+        driver="GPKG",
+    )
+
+    points.to_crs(WGS84).to_file(
+        output_geojson,
+        driver="GeoJSON",
+    )
+
+    print(f"  Rate points: {len(points):,}")
+    print(f"  BNG GPKG:    {output_gpkg}")
+    print(f"  Web GeoJSON: {output_geojson}")
+
+    return points
+
+
+def analyse_existing_tile(row):
+    """Add DEA rate outputs to an already-extracted tile without redoing STAC/tides.
+
+    This path is used when annual shoreline vectors already exist but the
+    rates-of-change outputs do not. It reloads the completed annual/gapfill
+    rasters, reconstructs the buffered shoreline contours, and runs only the
+    vector analysis stages.
+    """
+    tile_id = str(row[TILE_ID_FIELD])
+    tile_no = int(row[TILE_NO_FIELD])
+    core_geometry = row.geometry
+
+    coastal_closing_pixels = COASTAL_CLOSING_OVERRIDES.get(
+        tile_no,
+        COASTAL_CLOSING_DEFAULT,
+    )
+
+    _, _, vector_dir = versioned_paths(tile_id)
+
+    print(
+        f"Shorelines already exist for {tile_id}; "
+        "running analysis from existing rasters."
+    )
+
+    yearly_ds, gapfill_ds = load_rasters(
+        path=str(RASTER_ROOT),
+        raster_version=RASTER_VERSION,
+        study_area=tile_id,
+        water_index=WATER_INDEX,
+        start_year=START_YEAR,
+        end_year=END_YEAR,
+    )
+
+    seed_file = vector_dir / "ocean_seed_points.gpkg"
+
+    if seed_file.exists():
+        seeds = gpd.read_file(seed_file).to_crs(yearly_ds.rio.crs)
+    else:
+        seeds = ocean_seeds(yearly_ds)
+        seeds.to_file(
+            seed_file,
+            driver="GPKG",
+        )
+
+    masked_ds, _ = contours_preprocess(
+        yearly_ds=yearly_ds,
+        gapfill_ds=gapfill_ds,
+        water_index=WATER_INDEX,
+        index_threshold=INDEX_THRESHOLD,
+        tide_points_gdf=seeds,
+        buffer_pixels=33,
+        coastal_closing_pixels=coastal_closing_pixels,
+        mask_landcover=False,
+        mask_ndwi=True,
+        mask_temporal=True,
+        mask_modifications=None,
+    )
+
+    contours = subpixel_contours(
+        da=masked_ds,
+        z_values=INDEX_THRESHOLD,
+        min_vertices=10,
+        dim="year",
+    ).set_index("year")
+
+    return analyse_tile_rates(
+        contours=contours,
+        yearly_ds=yearly_ds,
+        core_geometry=core_geometry,
+        tile_id=tile_id,
+        tile_no=tile_no,
+        vector_dir=vector_dir,
+    )
+
+
+def selected_output_label(tiles, national=False):
+    """Return a stable label for pilot, national or ad-hoc selections."""
+    if national:
+        return "Scotland"
+
+    tile_numbers = tuple(
+        sorted(tiles[TILE_NO_FIELD].astype(int).tolist())
+    )
+
+    pilot_numbers = tuple(sorted(PILOT_TILE_NOS or []))
+
+    if tile_numbers == pilot_numbers:
+        return "Scotland_pilot11"
+
+    return "Scotland_tiles_" + "_".join(
+        str(value)
+        for value in tile_numbers
+    )
+
+
+def merge_completed_shorelines(tiles):
+    """Merge completed core-clipped annual shoreline GPKGs for selected tiles."""
+    frames = []
+    missing = []
+
+    for _, row in tiles.iterrows():
+        tile_id = str(row[TILE_ID_FIELD])
+        _, _, vector_dir = versioned_paths(tile_id)
+
+        shoreline_path = (
+            vector_dir
+            / (
+                f"annualshorelines_{tile_id}_{VECTOR_VERSION}_"
+                f"{WATER_INDEX}_{INDEX_THRESHOLD:.2f}_BNG.gpkg"
+            )
+        )
+
+        if not shoreline_path.exists():
+            missing.append(tile_id)
+            continue
+
+        frame = gpd.read_file(shoreline_path).to_crs(CRS)
+
+        if frame.empty:
+            continue
+
+        frames.append(frame)
+
+    if not frames:
+        raise RuntimeError(
+            "No completed shoreline GPKGs found for the selected tiles."
+        )
+
+    merged = gpd.GeoDataFrame(
+        pd.concat(frames, ignore_index=True),
+        crs=CRS,
+    )
+
+    merged = merged[
+        merged.geometry.notnull()
+        & ~merged.geometry.is_empty
+    ].copy()
+
+    if "shoreline_id" in merged.columns:
+        merged = merged.drop_duplicates(
+            subset="shoreline_id",
+            keep="first",
+        )
+
+    if missing:
+        print(
+            "No shoreline output for selected tile(s): "
+            + ", ".join(missing)
+        )
+
+    return merged
+
+
+def merge_completed_rates(tiles):
+    """Merge completed per-tile DEA rate-point GPKGs for selected tiles."""
+    frames = []
+    missing = []
+
+    for _, row in tiles.iterrows():
+        tile_id = str(row[TILE_ID_FIELD])
+        output_gpkg, _ = rate_output_paths(tile_id)
+
+        if not output_gpkg.exists():
+            missing.append(tile_id)
+            continue
+
+        frame = gpd.read_file(output_gpkg).to_crs(CRS)
+
+        if frame.empty:
+            continue
+
+        frames.append(frame)
+
+    if not frames:
+        print("No completed rate-point GPKGs found for selected tiles.")
+        return None
+
+    merged = gpd.GeoDataFrame(
+        pd.concat(frames, ignore_index=True),
+        crs=CRS,
+    )
+
+    merged = merged[
+        merged.geometry.notnull()
+        & ~merged.geometry.is_empty
+    ].copy()
+
+    if "point_id" in merged.columns:
+        merged = merged.drop_duplicates(
+            subset="point_id",
+            keep="first",
+        )
+
+    if missing:
+        print(
+            "No rates output for selected tile(s): "
+            + ", ".join(missing)
+        )
+
+    return merged
+
+
+def write_merged_products(
+    shorelines,
+    rates,
+    tiles,
+    national=False,
+):
+    """Write merged scientific, web and CMT-handoff products.
+
+    GPKG outputs remain in EPSG:27700 and are the analysis/master products.
+    GeoJSON outputs are transformed to EPSG:4326 for CoastalMappingViewer.
+    No dissolve is applied across tile boundaries, preserving source provenance.
+    """
+    label = selected_output_label(
+        tiles,
+        national=national,
+    )
+
+    output_dir = (
+        ANALYSIS_ROOT
+        / VECTOR_VERSION
+        / label
+    )
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    shoreline_stem = (
+        f"{label}_DEA_MSL_annual_shorelines_"
+        f"{START_YEAR}_{END_YEAR}"
+    )
+
+    shoreline_gpkg = output_dir / f"{shoreline_stem}_BNG.gpkg"
+    shoreline_geojson = output_dir / f"{shoreline_stem}.geojson"
+
+    shorelines.to_file(
+        shoreline_gpkg,
+        layer="annual_shorelines",
+        driver="GPKG",
+    )
+
+    shorelines.to_crs(WGS84).to_file(
+        shoreline_geojson,
+        driver="GeoJSON",
+    )
+
+    # Explicit CMT handoff: the latest mature MSL shoreline is retained as a
+    # baseline candidate. It is not smoothed or converted to transects here.
+    baseline = shorelines[
+        shorelines["year"].astype(int) == BASELINE_YEAR
+    ].copy()
+
+    baseline_gpkg = (
+        output_dir
+        / f"{label}_CMT_baseline_candidate_DEA_MSL_{BASELINE_YEAR}_BNG.gpkg"
+    )
+
+    baseline_geojson = (
+        output_dir
+        / f"{label}_CMT_baseline_candidate_DEA_MSL_{BASELINE_YEAR}.geojson"
+    )
+
+    if not baseline.empty:
+        baseline.to_file(
+            baseline_gpkg,
+            layer="baseline_candidate",
+            driver="GPKG",
+        )
+
+        baseline.to_crs(WGS84).to_file(
+            baseline_geojson,
+            driver="GeoJSON",
+        )
+
+    print()
+    print("Merged annual shoreline products:")
+    print(f"  BNG GPKG:    {shoreline_gpkg}")
+    print(f"  Web GeoJSON: {shoreline_geojson}")
+
+    if not baseline.empty:
+        print(f"  CMT baseline candidate: {baseline_gpkg}")
+
+    if rates is None or rates.empty:
+        return
+
+    rates_stem = (
+        f"{label}_DEA_MSL_ratesofchange_"
+        f"baseline{BASELINE_YEAR}"
+    )
+
+    rates_gpkg = output_dir / f"{rates_stem}_BNG.gpkg"
+    rates_geojson = output_dir / f"{rates_stem}.geojson"
+
+    rates.to_file(
+        rates_gpkg,
+        layer="rates_of_change",
+        driver="GPKG",
+    )
+
+    rates.to_crs(WGS84).to_file(
+        rates_geojson,
+        driver="GeoJSON",
+    )
+
+    print()
+    print("Merged DEA change-analysis products:")
+    print(f"  BNG GPKG:    {rates_gpkg}")
+    print(f"  Web GeoJSON: {rates_geojson}")
+    print(f"  Rate points: {len(rates):,}")
+
+
+def run_analysis(tiles, national=False):
+    """Merge selected tile products after per-tile DEA analysis has completed."""
+    print()
+    print("Merging completed annual shorelines...")
+    shorelines = merge_completed_shorelines(
+        tiles
+    )
+
+    print(
+        f"  {len(shorelines):,} shoreline features "
+        f"across {shorelines['year'].nunique()} years"
+    )
+
+    print("Merging completed DEA rate points...")
+    rates = merge_completed_rates(
+        tiles
+    )
+
+    write_merged_products(
+        shorelines=shorelines,
+        rates=rates,
+        tiles=tiles,
+        national=national,
+    )
+
 # =============================================================================
 # ONE GRID TILE
 # =============================================================================
 
 
-def run_tile(row, fresh=False):
-    """Run the full buffered raster -> core-clipped vector workflow."""
+def run_tile(row, fresh=False, analyse=False):
+    """Run the full buffered raster -> core-clipped vector workflow.
+
+    If analyse=True, DEA's native baseline-point change analysis is also
+    generated for this tile.
+    """
 
     tile_id = str(row[TILE_ID_FIELD])
     tile_no = int(row[TILE_NO_FIELD])
@@ -775,7 +1393,7 @@ def run_tile(row, fresh=False):
         tile_no,
         COASTAL_CLOSING_DEFAULT,
     )
-    
+
     core_geometry = row.geometry
     process_geometry = processing_footprint(core_geometry)
     bbox = wgs84_bbox(process_geometry)
@@ -830,8 +1448,17 @@ def run_tile(row, fresh=False):
         )
     )
 
+    rate_gpkg, rate_geojson = rate_output_paths(tile_id)
+
     if output_geojson.exists() and not fresh:
         print(f"Already complete: {output_geojson}")
+
+        if analyse and not (
+            rate_gpkg.exists()
+            and rate_geojson.exists()
+        ):
+            analyse_existing_tile(row)
+
         return {
             "tile_no": tile_no,
             "tile_id": tile_id,
@@ -1088,6 +1715,7 @@ def run_tile(row, fresh=False):
             output_dir=vector_dir / "mask_diagnostics",
             tile_id=tile_id,
             tile_no=tile_no,
+            coastal_closing_pixels=coastal_closing_pixels,
         )
 
     masked_ds, certainty = contours_preprocess(
@@ -1110,6 +1738,19 @@ def run_tile(row, fresh=False):
         min_vertices=10,
         dim="year",
     ).set_index("year")
+
+    # DEA change analysis must use the unsplit buffered contours. Certainty
+    # attribution below can split a year's shoreline into multiple geometries,
+    # whereas annual_movements expects one annual geometry.
+    if analyse:
+        analyse_tile_rates(
+            contours=contours,
+            yearly_ds=yearly_ds,
+            core_geometry=core_geometry,
+            tile_id=tile_id,
+            tile_no=tile_no,
+            vector_dir=vector_dir,
+        )
 
     contours.index = contours.index.astype(str)
 
@@ -1162,6 +1803,7 @@ def run_tile(row, fresh=False):
     shorelines["tide_model"] = TIDE_MODEL
     shorelines["tide_datum"] = "model MSL"
     shorelines["processing_buffer_m"] = PROCESSING_BUFFER_M
+    shorelines["coastal_closing_pixels"] = coastal_closing_pixels
     shorelines["raster_version"] = RASTER_VERSION
     shorelines["vector_version"] = VECTOR_VERSION
 
@@ -1211,6 +1853,7 @@ def run_tile(row, fresh=False):
     }
 
 
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -1245,6 +1888,7 @@ def main():
     print(f"Raster version:  {RASTER_VERSION}")
     print(f"Vector version:  {VECTOR_VERSION}")
     print(f"Fresh run:       {args.fresh}")
+    print(f"Run analysis:    {args.analyse}")
     print(f"Years:           {START_YEAR}-{END_YEAR}")
     print(f"Tide model:      {TIDE_MODEL}")
     print("=" * 78)
@@ -1259,6 +1903,7 @@ def main():
             result = run_tile(
                 row,
                 fresh=args.fresh,
+                analyse=args.analyse,
             )
             results.append(result)
 
@@ -1335,6 +1980,17 @@ def main():
                     f"{result['error']}"
                 )
 
+    if args.analyse:
+
+        print()
+        print("=" * 78)
+        print("RUNNING POST-PROCESSING AND CHANGE ANALYSIS")
+        print("=" * 78)
+
+        run_analysis(
+            tiles=tiles,
+            national=args.all,
+        )
 
 if __name__ == "__main__":
     main()
