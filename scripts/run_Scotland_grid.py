@@ -70,6 +70,7 @@ from coastlines.vector import (
     all_time_stats,
     annual_movements,
     calculate_regressions,
+    change_regress,
     coastal_masking,
     contour_certainty,
     contours_preprocess,
@@ -144,6 +145,13 @@ BASELINE_YEAR = 2024
 POINT_SPACING_M = 30
 ANALYSIS_CONTEXT_M = 5000
 MAX_VALID_DIST_M = 5000
+
+# time period to calculate rates over
+RATE_PERIODS = {
+    "1988_2025": (1988, 2025),
+    "2000_2025": (2000, 2025),
+    "2015_2025": (2015, 2025),
+}
 
 # =============================================================================
 # VERSIONING
@@ -815,6 +823,62 @@ def rate_output_paths(tile_id):
         vector_dir / f"{stem}.geojson",
     )
 
+def calculate_period_rate(points_gdf, start_year, end_year, suffix):
+    """Calculate DEA-style linear change rate for a specified year range."""
+
+    years = np.arange(start_year, end_year + 1)
+
+    dist_cols = [
+        f"dist_{year}"
+        for year in years
+        if f"dist_{year}" in points_gdf.columns
+    ]
+
+    years = np.array(
+        [int(col.replace("dist_", "")) for col in dist_cols]
+    )
+
+    slope_field = f"rate_{suffix}"
+    intercept_field = f"incpt_{suffix}"
+    pvalue_field = f"sig_{suffix}"
+    stderr_field = f"se_{suffix}"
+    outliers_field = f"outl_{suffix}"
+    valid_field = f"valid_obs_{suffix}"
+
+    rate_out = points_gdf[dist_cols].apply(
+        lambda row: change_regress(
+            y_vals=row.values.astype(float),
+            x_vals=years,
+            x_labels=years,
+            slope_var=slope_field,
+            interc_var=intercept_field,
+            pvalue_var=pvalue_field,
+            stderr_var=stderr_field,
+            outliers_var=outliers_field,
+        ),
+        axis=1,
+    )
+
+    points_gdf[
+        [
+            slope_field,
+            intercept_field,
+            pvalue_field,
+            stderr_field,
+            outliers_field,
+        ]
+    ] = rate_out
+
+    points_gdf[valid_field] = points_gdf.apply(
+        lambda row: sum(
+            pd.notna(row[col])
+            and str(year) not in str(row[outliers_field]).split()
+            for col, year in zip(dist_cols, years)
+        ),
+        axis=1,
+    )
+
+    return points_gdf
 
 def analyse_tile_rates(
     contours,
@@ -888,10 +952,10 @@ def analyse_tile_rates(
         max_valid_dist=MAX_VALID_DIST_M,
     )
 
-    points = calculate_regressions(
-        points,
-        analysis_contours,
-    )
+    # calculate rates by regression for full record and most recent 10 years
+    points = calculate_regressions(points, analysis_contours)
+    for period, (start_year, end_year) in RATE_PERIODS.items():
+        points = calculate_period_rate(points, start_year, end_year, period)
 
     stats_fields = [
         "valid_obs",
@@ -975,11 +1039,28 @@ def analyse_tile_rates(
         "indicator",
         "baseline_year",
         "point_spacing_m",
-        "rate_time",
-        "sig_time",
-        "se_time",
-        "valid_obs",
-        "valid_span",
+
+        # Explicit full-record rate: 1988-2025
+        "rate_1988_2025",
+        "sig_1988_2025",
+        "se_1988_2025",
+        "outl_1988_2025",
+        "valid_obs_1988_2025",
+
+        # Medium-term rate: 2000-2025
+        "rate_2000_2025",
+        "sig_2000_2025",
+        "se_2000_2025",
+        "outl_2000_2025",
+        "valid_obs_2000_2025",
+
+        # Recent rate: 2015-2025
+        "rate_2015_2025",
+        "sig_2015_2025",
+        "se_2015_2025",
+        "outl_2015_2025",
+        "valid_obs_2015_2025",
+        
         "sce",
         "nsm",
         "max_year",
