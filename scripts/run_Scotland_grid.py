@@ -91,7 +91,7 @@ RESULTS_FOLDER = HOME_FOLDER / "scotland_dea_results"
 TIDE_MODEL_DIR = HOME_FOLDER / "tide_models"
 
 # Copy the 20 km core grid into the repository data folder.
-GRID_FILE = HOME_FOLDER / "Scotland_DEA_20km_core_tiles.geojson"
+GRID_FILE = HOME_FOLDER / "Scotland_DEA_20km_core_tiles.gpkg"
 TILE_ID_FIELD = "tile_id"
 TILE_NO_FIELD = "tile_no"
 
@@ -342,6 +342,25 @@ def validate_and_select_grid(args):
     if grid.crs is None:
         raise ValueError("Grid file has no CRS.")
 
+    # TEMPORARY DEBUG: check that the grid is read correctly and can be reprojected.
+    print("Input grid CRS:", grid.crs)
+
+    if args.tiles is not None:
+        for tile_no in args.tiles:
+
+            test = grid.loc[
+                grid[TILE_NO_FIELD].astype(int) == int(tile_no)
+            ].copy()
+
+            print(f"Tile {tile_no} bounds as read:")
+            print(test.geometry.bounds)
+
+            test_bng = test.to_crs("EPSG:27700")
+
+            print(f"Tile {tile_no} bounds after to_crs(27700):")
+            print(test_bng.geometry.bounds)
+
+
     grid = grid.to_crs(CRS)
 
     required = {TILE_ID_FIELD, TILE_NO_FIELD}
@@ -386,15 +405,30 @@ def validate_and_select_grid(args):
     selected = selected.sort_values(TILE_NO_FIELD).reset_index(drop=True)
 
     # Sanity check the regular 20 km core geometry.
-    widths = selected.geometry.bounds.maxx - selected.geometry.bounds.minx
-    heights = selected.geometry.bounds.maxy - selected.geometry.bounds.miny
+    bounds = selected.geometry.bounds
 
-    if not (
-        np.allclose(widths, 20000, atol=1)
-        and np.allclose(heights, 20000, atol=1)
-    ):
+    widths = bounds["maxx"] - bounds["minx"]
+    heights = bounds["maxy"] - bounds["miny"]
+
+    bad = selected.loc[
+        (~np.isclose(widths, 20000, atol=1))
+        | (~np.isclose(heights, 20000, atol=1))
+    ].copy()
+
+    if not bad.empty:
+        bad["width_m"] = widths.loc[bad.index]
+        bad["height_m"] = heights.loc[bad.index]
+
+        print()
+        print("Grid cells failing 20 x 20 km check:")
+        print(
+            bad[
+                [TILE_NO_FIELD, TILE_ID_FIELD, "width_m", "height_m"]
+            ].to_string(index=False)
+        )
+
         raise ValueError(
-            "Selected grid contains cells that are not 20 x 20 km BNG cores."
+            f"{len(bad)} selected grid cell(s) are not 20 x 20 km BNG cores."
         )
 
     return selected
@@ -1060,7 +1094,7 @@ def analyse_tile_rates(
         "se_2015_2025",
         "outl_2015_2025",
         "valid_obs_2015_2025",
-        
+
         "sce",
         "nsm",
         "max_year",
@@ -1530,6 +1564,23 @@ def run_tile(row, fresh=False, analyse=False):
     )
 
     rate_gpkg, rate_geojson = rate_output_paths(tile_id)
+
+    # When running analysis over an existing national run, do not restart
+    # tiles whose shoreline extraction did not complete.
+    if analyse and not fresh and not (
+        output_gpkg.exists() and output_geojson.exists()
+    ):
+        print(
+            f"Skipping {tile_id}: no completed shoreline output "
+            "available for analysis."
+        )
+
+        return {
+            "tile_no": tile_no,
+            "tile_id": tile_id,
+            "status": "skipped_no_shoreline",
+            "error": "",
+        }
 
     if output_geojson.exists() and not fresh:
         print(f"Already complete: {output_geojson}")
