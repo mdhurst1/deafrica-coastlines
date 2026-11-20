@@ -7,6 +7,7 @@ from functools import cache
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import sleep
 
 import geopandas as gpd
 import numpy as np
@@ -17,6 +18,7 @@ import rioxarray
 import xarray as xr
 from dea_tools.spatial import subpixel_contours
 from odc.stac import load
+from pystac_client.exceptions import APIError
 from rasterio.features import shapes
 from shapely.geometry import shape
 from shapely.ops import unary_union
@@ -52,6 +54,26 @@ WORLDCOVER_PALETTE = {
 }
 
 
+def retry_catalog(label, operation, *args, **kwargs):
+    """Retry transient HTTP responses from the STAC catalogue."""
+    for delay in (5, 15, 30, None):
+        try:
+            return operation(*args, **kwargs)
+        except APIError as exc:
+            status = getattr(exc, "status_code", None)
+            if delay is None or status not in (429, 500, 502, 503, 504):
+                raise
+            print(f"  {label}: HTTP {status}. Retrying in {delay}s.", flush=True)
+            sleep(delay)
+
+
+def worldcover_items(bbox):
+    catalog = pystac_client.Client.open(PLANETARY_COMPUTER_STAC)
+    return list(catalog.search(
+        collections=["esa-worldcover"], bbox=bbox, datetime="2021-01-01/2021-12-31"
+    ).items())
+
+
 def worldcover_mask(bbox, output):
     """Save the full 10 m class raster and return its built-up and water polygons."""
     path = output / "worldcover_2021.tif"
@@ -61,10 +83,7 @@ def worldcover_mask(bbox, output):
             if raster.tags().get("aoi_key") == area_key:
                 return exclusion_polygons(raster.read(1), raster.transform)
 
-    catalog = pystac_client.Client.open(PLANETARY_COMPUTER_STAC)
-    items = list(catalog.search(
-        collections=["esa-worldcover"], bbox=bbox, datetime="2021-01-01/2021-12-31"
-    ).items())
+    items = retry_catalog("WorldCover catalogue", worldcover_items, bbox)
     if not items:
         raise RuntimeError("No ESA WorldCover 2021 tiles cover the Montrose AOI")
 
@@ -103,7 +122,8 @@ def exclusion_polygons(classes, transform):
 
 @cache
 def dem_for_grid(bbox, resolution):
-    return load_dem_stac(bbox, output_crs=CRS, resolution=resolution).compute()
+    dem = retry_catalog("DEM catalogue", load_dem_stac, bbox, output_crs=CRS, resolution=resolution)
+    return dem.compute()
 
 
 def summer_composite(sensor, year, bbox, output):
@@ -118,9 +138,11 @@ def summer_composite(sensor, year, bbox, output):
         with xr.open_dataset(path) as saved:
             return saved.load()
 
-    imagery = loader(
-        bbox, f"{start}/{end}", output_crs=CRS, resolution=resolution,
-        dem=dem_for_grid(bbox, resolution), mask_terrain_shadow=True, include_ndvi=True,
+    dem = dem_for_grid(bbox, resolution)
+    imagery = retry_catalog(
+        f"{sensor} {year} catalogue", loader, bbox, f"{start}/{end}",
+        output_crs=CRS, resolution=resolution, dem=dem, mask_terrain_shadow=True,
+        include_ndvi=True,
     )
     ndvi = imagery.ndvi.transpose("time", "y", "x").compute()
     composite = xr.Dataset({
