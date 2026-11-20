@@ -34,7 +34,8 @@ ROOT = Path(__file__).resolve().parents[1]
 INPUTS = ROOT / "pilot_inputs" / "montrose_vedge"
 OUTPUT = ROOT.parent / "montrose_vedge_results"
 
-YEARS = range(2018, 2026)
+YEARS = range(1988, 2026)
+SENTINEL2_FIRST_YEAR = 2015
 FIRST_MONTH, LAST_MONTH = 5, 9
 NDVI_THRESHOLD = 0.20
 MIN_OBSERVATIONS = 3
@@ -139,11 +140,18 @@ def summer_composite(sensor, year, bbox, output):
             return saved.load()
 
     dem = dem_for_grid(bbox, resolution)
-    imagery = retry_catalog(
-        f"{sensor} {year} catalogue", loader, bbox, f"{start}/{end}",
-        output_crs=CRS, resolution=resolution, dem=dem, mask_terrain_shadow=True,
-        include_ndvi=True,
-    )
+    try:
+        imagery = retry_catalog(
+            f"{sensor} {year} catalogue", loader, bbox, f"{start}/{end}",
+            output_crs=CRS, resolution=resolution, dem=dem, mask_terrain_shadow=True,
+            include_ndvi=True,
+        )
+    except RuntimeError as exc:
+        if not str(exc).startswith(("No Landsat scenes found for bbox=",
+                                    "No Sentinel-2 L2A scenes found for bbox=")):
+            raise
+        print(f"  No scenes for {start}/{end}; skipping {sensor} {year}.", flush=True)
+        return None
     ndvi = imagery.ndvi.transpose("time", "y", "x").compute()
     composite = xr.Dataset({
         "ndvi": (("y", "x"), ndvi.median("time", skipna=True).values),
@@ -201,8 +209,12 @@ def main():
         for sensor in SENSORS:
             unmasked, masked = [], []
             for year in YEARS:
+                if sensor == "sentinel2" and year < SENTINEL2_FIRST_YEAR:
+                    continue
                 print(f"{sensor} {year}", flush=True)
                 composite = summer_composite(sensor, year, bbox, OUTPUT)
+                if composite is None:
+                    continue
                 lines = vegetation_edges(composite, corridor)
                 properties = {"year": year, "sensor": sensor, "indicator": "DEA_VEdge_candidate",
                               "ndvi_threshold": NDVI_THRESHOLD, "min_observations": MIN_OBSERVATIONS}
