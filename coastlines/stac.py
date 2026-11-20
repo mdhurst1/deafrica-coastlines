@@ -3,7 +3,7 @@ import numpy as np
 import xarray as xr
 
 from dea_tools.spatial import hillshade
-from skimage.morphology import binary_dilation, binary_opening, disk
+from skimage.morphology import dilation, opening, disk
 
 import pystac_client
 import planetary_computer
@@ -504,16 +504,10 @@ def terrain_shadow_stac(
     shadow = hs < threshold
 
     # Remove small isolated areas
-    shadow = binary_opening(
-        shadow,
-        disk(radius),
-    )
+    shadow = opening(shadow, disk(radius))
 
     # Expand remaining shadow slightly to include shadow edges
-    shadow = binary_dilation(
-        shadow,
-        disk(radius),
-    )
+    shadow = dilation(shadow, disk(radius))
 
     # Preserve DEM coordinates where available
     if y is not None and x is not None:
