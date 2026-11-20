@@ -32,7 +32,7 @@ from eo_tides.eo import pixel_tides
 from shapely.geometry import Point
 
 from coastlines.raster import load_tidal_subset, tidal_composite, tide_cutoffs
-from coastlines.stac import load_dem_stac, load_water_index_stac
+from coastlines.stac import load_dem_stac, load_sentinel2_indices_stac, load_water_index_stac
 from coastlines.vector import contour_certainty, contours_preprocess, load_rasters
 
 # =============================================================================
@@ -59,6 +59,7 @@ RESOLUTION = 30
 
 START_YEAR, END_YEAR = 1988, 2025
 CUTOFF_START, CUTOFF_END = 1984, 2025
+SENTINEL2_YEARS = (2019, 2024)
 
 TIDE_MODEL = "FES2022_extrapolated"  # see eo-tides for other options
 PLATFORMS = ["landsat-5", "landsat-7", "landsat-8", "landsat-9"]
@@ -111,7 +112,19 @@ def parse_args():
             "for the CURRENT RASTER_VERSION/VECTOR_VERSION before running."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument("--sensor", choices=("landsat", "sentinel2"), default="landsat")
+    parser.add_argument("--sites", nargs="+", metavar="SITE", help="Override the configured AOI names.")
+    parser.add_argument("--tide-model", default=TIDE_MODEL,
+                        help="Tide model name, for example EOT20 to match older Montrose outputs.")
+    parser.add_argument("--years", nargs=2, type=int, metavar=("FIRST", "LAST"),
+                        help="Override the Sentinel-2 annual output range (default 2019–2024).")
+    args = parser.parse_args()
+    if args.years is not None:
+        if args.sensor != "sentinel2":
+            parser.error("--years is only used with --sensor sentinel2")
+        if not 2016 <= args.years[0] <= args.years[1]:
+            parser.error("Sentinel-2 years must be ordered and start at 2016 or later for gapfill")
+    return args
 
 
 def slugify(name):
@@ -186,18 +199,20 @@ def rasters_exist(folder, year, suffix=""):
     return all((folder / f"{year}_{v}{suffix}.tif").exists() for v in variables)
 
 
-def versioned_paths(site):
+def versioned_paths(site, raster_version=None, vector_version=None):
     """Return all version-specific paths for one AOI."""
-    cache = CACHE_ROOT / RASTER_VERSION / f"{site}_{RASTER_VERSION}"
-    raster_dir = RASTER_ROOT / RASTER_VERSION / f"{site}_{RASTER_VERSION}"
-    vector_dir = VECTOR_ROOT / VECTOR_VERSION / f"{site}_{VECTOR_VERSION}"
+    raster_version = raster_version or RASTER_VERSION
+    vector_version = vector_version or VECTOR_VERSION
+    cache = CACHE_ROOT / raster_version / f"{site}_{raster_version}"
+    raster_dir = RASTER_ROOT / raster_version / f"{site}_{raster_version}"
+    vector_dir = VECTOR_ROOT / vector_version / f"{site}_{vector_version}"
 
     return cache, raster_dir, vector_dir
 
 
-def clear_current_version(site):
+def clear_current_version(site, raster_version=None, vector_version=None):
     """Delete only this AOI's products for the current versions."""
-    cache, raster_dir, vector_dir = versioned_paths(site)
+    cache, raster_dir, vector_dir = versioned_paths(site, raster_version, vector_version)
 
     for path in [cache, raster_dir, vector_dir]:
         if path.exists():
@@ -256,12 +271,33 @@ def ocean_seeds(yearly_ds, max_points=50):
 # =============================================================================
 
 
-def run_aoi(row, fresh=False):
+def run_aoi(row, fresh=False, *, sensor="landsat", years=None, tide_model=None):
     """Run the complete raster-to-shoreline workflow for one AOI."""
 
     name = str(row[NAME_FIELD])
     site = slugify(name)
     geometry = row.geometry
+    tide_model = tide_model or TIDE_MODEL
+    if sensor == "sentinel2":
+        start_year, end_year = years or SENTINEL2_YEARS
+        cutoff_start, cutoff_end = start_year - 1, end_year + 1
+        resolution = 20
+        suffix = f"_sentinel2_{start_year}_{end_year}"
+        loader = load_sentinel2_indices_stac
+        options = {}
+    else:
+        start_year, end_year = START_YEAR, END_YEAR
+        cutoff_start, cutoff_end = CUTOFF_START, CUTOFF_END
+        resolution = RESOLUTION
+        suffix = ""
+        loader = load_water_index_stac
+        options = {"platforms": PLATFORMS}
+    model_cache_name = TIDE_MODEL
+    if tide_model != TIDE_MODEL:
+        model_cache_name = slugify(tide_model)
+        suffix += f"_{model_cache_name}"
+    raster_version = RASTER_VERSION + suffix
+    vector_version = VECTOR_VERSION + suffix
 
     bbox = list(
         gpd.GeoSeries([geometry], crs=CRS)
@@ -272,17 +308,17 @@ def run_aoi(row, fresh=False):
     print("\n" + "=" * 78)
     print(f"AOI:            {name}")
     print(f"Site ID:        {site}")
-    print(f"Raster version: {RASTER_VERSION}")
-    print(f"Vector version: {VECTOR_VERSION}")
+    print(f"Raster version: {raster_version}")
+    print(f"Vector version: {vector_version}")
     print("=" * 78)
 
     if fresh:
-        clear_current_version(site)
+        clear_current_version(site, raster_version, vector_version)
 
-    cache, raster_dir, vector_dir = versioned_paths(site)
+    cache, raster_dir, vector_dir = versioned_paths(site, raster_version, vector_version)
 
     dem_file = cache / "cop_dem_glo30_bng.tif"
-    cutoff_file = cache / f"{TIDE_MODEL}_cutoffs_{CUTOFF_START}_{CUTOFF_END}.nc"
+    cutoff_file = cache / f"{model_cache_name}_cutoffs_{cutoff_start}_{cutoff_end}.nc"
     tide_dir = cache / "tides"
     obs_dir = cache / "tidal_observations"
 
@@ -291,11 +327,11 @@ def run_aoi(row, fresh=False):
 
     output_geojson = (
         vector_dir
-        / f"annualshorelines_{site}_{VECTOR_VERSION}_{WATER_INDEX}_{INDEX_THRESHOLD:.2f}.geojson"
+        / f"annualshorelines_{site}_{vector_version}_{WATER_INDEX}_{INDEX_THRESHOLD:.2f}.geojson"
     )
     output_gpkg = (
         vector_dir
-        / f"annualshorelines_{site}_{VECTOR_VERSION}_{WATER_INDEX}_{INDEX_THRESHOLD:.2f}_BNG.gpkg"
+        / f"annualshorelines_{site}_{vector_version}_{WATER_INDEX}_{INDEX_THRESHOLD:.2f}_BNG.gpkg"
     )
 
     # Resumable mode: a completed vector product means this AOI is finished.
@@ -319,23 +355,23 @@ def run_aoi(row, fresh=False):
         dem = load_dem_stac(
             bbox,
             output_crs=CRS,
-            resolution=RESOLUTION,
+            resolution=resolution,
         ).compute()
         dem.rio.to_raster(dem_file)
 
     def load_year(year, shadow=False, fail_on_error=True):
-        return load_water_index_stac(
+        return loader(
             bbox=bbox,
             datetime=f"{year}-01-01/{year}-12-31",
             output_crs=CRS,
-            resolution=RESOLUTION,
+            resolution=resolution,
             cloud_cover=CLOUD_COVER,
-            platforms=PLATFORMS,
             fail_on_error=fail_on_error,
             dem=dem if shadow else None,
             mask_terrain_shadow=shadow,
             terrain_shadow_threshold=SHADOW_THRESHOLD,
             terrain_shadow_radius=SHADOW_RADIUS,
+            **options,
         )
 
     # -------------------------------------------------------------------------
@@ -350,24 +386,24 @@ def run_aoi(row, fresh=False):
     else:
         print("Building site-specific tidal cutoffs...")
 
-        record = load_water_index_stac(
+        record = loader(
             bbox=bbox,
-            datetime=f"{CUTOFF_START}-01-01/{CUTOFF_END}-12-31",
+            datetime=f"{cutoff_start}-01-01/{cutoff_end}-12-31",
             output_crs=CRS,
-            resolution=RESOLUTION,
+            resolution=resolution,
             cloud_cover=CLOUD_COVER,
-            platforms=PLATFORMS,
+            **options,
         )
 
         tides_lowres = pixel_tides(
             data=record,
-            model=TIDE_MODEL,
+            model=tide_model,
             directory=TIDE_MODEL_DIR,
             resample=False,
         ).compute()
 
         cutoff_min, cutoff_max = tide_cutoffs(
-            ds=load_year(START_YEAR),
+            ds=load_year(start_year),
             tides_lowres=tides_lowres,
             tide_centre=0.0,
         )
@@ -398,7 +434,7 @@ def run_aoi(row, fresh=False):
         else:
             tides = pixel_tides(
                 data=load_year(year),
-                model=TIDE_MODEL,
+                model=tide_model,
                 directory=TIDE_MODEL_DIR,
                 resample=True,
             ).rename("tide_m").compute()
@@ -420,7 +456,7 @@ def run_aoi(row, fresh=False):
                 if not set(ds.time.values).issubset(set(tides.time.values)):
                     tides = pixel_tides(
                         data=ds,
-                        model=TIDE_MODEL,
+                        model=tide_model,
                         directory=TIDE_MODEL_DIR,
                         resample=True,
                     ).rename("tide_m").compute()
@@ -452,11 +488,11 @@ def run_aoi(row, fresh=False):
 
     print("Creating/reusing annual raster composites...")
 
-    previous = observations(START_YEAR - 1)
-    current = observations(START_YEAR)
-    future = observations(START_YEAR + 1)
+    previous = observations(start_year - 1)
+    current = observations(start_year)
+    future = observations(start_year + 1)
 
-    for year in range(START_YEAR, END_YEAR + 1):
+    for year in range(start_year, end_year + 1):
         if not rasters_exist(raster_dir, year):
             tidal_composite(
                 current,
@@ -481,7 +517,7 @@ def run_aoi(row, fresh=False):
                 export_geotiff=True,
             )
 
-        if year < END_YEAR:
+        if year < end_year:
             previous = current
             current = future
             future = observations(year + 2)
@@ -496,11 +532,11 @@ def run_aoi(row, fresh=False):
     # outputs/dea_rasters/<RASTER_VERSION>/<site>_<RASTER_VERSION>/...
     yearly_ds, gapfill_ds = load_rasters(
         path=str(RASTER_ROOT),
-        raster_version=RASTER_VERSION,
+        raster_version=raster_version,
         study_area=site,
         water_index=WATER_INDEX,
-        start_year=START_YEAR,
-        end_year=END_YEAR,
+        start_year=start_year,
+        end_year=end_year,
     )
 
     seeds = ocean_seeds(yearly_ds)
@@ -515,10 +551,10 @@ def run_aoi(row, fresh=False):
         water_index=WATER_INDEX,
         index_threshold=INDEX_THRESHOLD,
         tide_points_gdf=seeds,
-        buffer_pixels=33,
+        buffer_pixels=round(33 * RESOLUTION / resolution),
         mask_landcover=False,
         mask_ndwi=True,
-        mask_temporal=True,
+        mask_temporal=start_year < end_year,
         mask_modifications=None,
     )
 
@@ -551,10 +587,12 @@ def run_aoi(row, fresh=False):
     shorelines["indicator"] = "DEA_MSL"
     shorelines["water_index"] = WATER_INDEX
     shorelines["threshold"] = INDEX_THRESHOLD
-    shorelines["tide_model"] = TIDE_MODEL
+    shorelines["tide_model"] = tide_model
     shorelines["tide_datum"] = "model MSL"
-    shorelines["raster_version"] = RASTER_VERSION
-    shorelines["vector_version"] = VECTOR_VERSION
+    shorelines["raster_version"] = raster_version
+    shorelines["vector_version"] = vector_version
+    if sensor == "sentinel2":
+        shorelines["sensor"] = "sentinel2"
 
     shorelines["segment_no"] = shorelines.groupby("year").cumcount() + 1
     shorelines["shoreline_id"] = (
@@ -607,8 +645,9 @@ def main():
 
     aois = aois.to_crs(CRS)
 
-    if SITES is not None:
-        wanted = {site.casefold() for site in SITES}
+    sites = args.sites if args.sites is not None else SITES
+    if sites is not None:
+        wanted = {site.casefold() for site in sites}
         aois = aois[
             aois[NAME_FIELD]
             .astype(str)
@@ -621,16 +660,17 @@ def main():
     print("SCOTLAND DEA COASTLINES AOI RUN")
     print("=" * 78)
     print(f"AOIs:           {len(aois)}")
-    print(f"Raster version: {RASTER_VERSION}")
-    print(f"Vector version: {VECTOR_VERSION}")
     print(f"Fresh run:      {args.fresh}")
-    print(f"Years:          {START_YEAR}-{END_YEAR}")
-    print(f"Tide model:     {TIDE_MODEL}")
+    years = args.years or (SENTINEL2_YEARS if args.sensor == "sentinel2" else (START_YEAR, END_YEAR))
+    print(f"Sensor:         {args.sensor}")
+    print(f"Years:          {years[0]}-{years[1]}")
+    print(f"Tide model:     {args.tide_model}")
     print("=" * 78)
 
     for _, row in aois.iterrows():
         try:
-            run_aoi(row, fresh=args.fresh)
+            run_aoi(row, fresh=args.fresh, sensor=args.sensor, years=args.years,
+                    tide_model=args.tide_model)
         except Exception as error:
             print(f"ERROR: {row[NAME_FIELD]} failed: {error}")
 
