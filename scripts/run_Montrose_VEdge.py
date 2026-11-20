@@ -1,152 +1,139 @@
 #!/usr/bin/env python3
-"""Compare annual NDVI vegetation-edge candidates with and without a tidal filter."""
+"""Extract summer vegetation edges from Landsat and Sentinel-2 at Montrose Bay."""
 
-import argparse
-import hashlib
+from calendar import monthrange
+from datetime import date
+from functools import cache
+from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import geopandas as gpd
-import matplotlib
 import numpy as np
-import pandas as pd
-import rioxarray  # registers the .rio accessor
+import planetary_computer
+import pystac_client
+import rasterio
+import rioxarray
 import xarray as xr
 from dea_tools.spatial import subpixel_contours
-from eo_tides.eo import pixel_tides
+from odc.stac import load
+from rasterio.features import shapes
+from shapely.geometry import shape
 from shapely.ops import unary_union
 
-from coastlines.stac import load_dem_stac, load_sentinel2_indices_stac, load_water_index_stac
+from coastlines.stac import (
+    PLANETARY_COMPUTER_STAC,
+    load_dem_stac,
+    load_sentinel2_indices_stac,
+    load_water_index_stac,
+)
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+ROOT = Path(__file__).resolve().parents[1]
+INPUTS = ROOT / "pilot_inputs" / "montrose_vedge"
+OUTPUT = ROOT.parent / "montrose_vedge_results"
 
-from tests.vedge_diagnostics import save_diagnostics, summarise_observations
+YEARS = range(2018, 2026)
+FIRST_MONTH, LAST_MONTH = 5, 9
+NDVI_THRESHOLD = 0.20
+MIN_OBSERVATIONS = 3
+CORRIDOR_METRES = 300
+MIN_LENGTH_METRES = 90
 
 CRS = "EPSG:27700"
-RESOLUTION = 30
-TIDE_MODEL = "FES2022_extrapolated"
-TIDE_MODEL_DIR = Path("/media/nevis_array/user_homes/mhurst/tide_models")
-INPUTS = Path(__file__).resolve().parents[1] / "pilot_inputs" / "montrose_vedge"
-TIDE_MODES = {"all_clear": "All clear observations", "tide_filtered": "Tide-filtered"}
+SENSORS = {
+    "landsat": (30, load_water_index_stac),
+    "sentinel2": (10, load_sentinel2_indices_stac),
+}
+WORLDCOVER_PALETTE = {
+    10: (0, 100, 0), 20: (255, 187, 34), 30: (255, 255, 76),
+    40: (240, 150, 255), 50: (250, 0, 0), 60: (180, 180, 180),
+    70: (240, 240, 240), 80: (0, 100, 200), 90: (0, 150, 160),
+    95: (0, 207, 117), 100: (250, 230, 160),
+}
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--aoi", type=Path, default=INPUTS / "aoi.geojson")
-    parser.add_argument("--shorelines", type=Path, default=INPUTS / "msl.geojson",
-                        help="MSL lines used to define the coastal search corridor.")
-    parser.add_argument("--references", type=Path, default=INPUTS / "references.geojson")
-    parser.add_argument("--transects", type=Path, default=INPUTS / "transects.geojson")
-    parser.add_argument("--sensor", choices=("landsat", "sentinel2"), default="landsat")
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--tide-model-dir", type=Path, default=TIDE_MODEL_DIR)
-    parser.add_argument("--tide-cache", type=Path,
-                        help="Optional existing folder of {year}_tides.nc files from the AOI run.")
-    parser.add_argument("--years", type=int, nargs="+", default=[2018, 2024])
-    parser.add_argument("--months", type=int, nargs=2, default=[5, 9],
-                        metavar=("FIRST", "LAST"))
-    parser.add_argument("--min-tide", type=float, default=0.0,
-                        help="Minimum tide height in metres relative to model MSL.")
-    parser.add_argument("--threshold", type=float, default=0.2,
-                        help="Trial fixed NDVI contour level.")
-    parser.add_argument("--min-count", type=int, default=3)
-    parser.add_argument("--corridor", type=float, default=300,
-                        help="Search distance in metres either side of the MSL lines.")
-    parser.add_argument("--min-length", type=float, default=90,
-                        help="Minimum length in metres of a retained contour segment.")
-    args = parser.parse_args()
-    if args.output is None:
-        suffix = "_sentinel2" if args.sensor == "sentinel2" else ""
-        args.output = Path(f"outputs/montrose_vedge{suffix}")
-    if args.sensor == "sentinel2" and min(args.years) < 2017:
-        parser.error("the Sentinel-2 pilot expects years from 2017 onwards")
-    if not 1 <= args.months[0] <= args.months[1] <= 12:
-        parser.error("--months must be in ascending order between 1 and 12")
-    if not -1 < args.threshold < 1 or not np.isfinite(args.min_tide):
-        parser.error("provide a threshold between -1 and 1 and a finite tide cutoff")
-    if args.min_count < 1 or not 0 < args.corridor < np.inf or not 0 < args.min_length < np.inf:
-        parser.error("minimum count, corridor distance and minimum length must be positive")
-    return args
+def worldcover_mask(bbox, output):
+    """Save the full 10 m class raster and return its built-up and water polygons."""
+    path = output / "worldcover_2021.tif"
+    area_key = sha256(repr(bbox).encode()).hexdigest()[:16]
+    if path.is_file():
+        with rasterio.open(path) as raster:
+            if raster.tags().get("aoi_key") == area_key:
+                return exclusion_polygons(raster.read(1), raster.transform)
+
+    catalog = pystac_client.Client.open(PLANETARY_COMPUTER_STAC)
+    items = list(catalog.search(
+        collections=["esa-worldcover"], bbox=bbox, datetime="2021-01-01/2021-12-31"
+    ).items())
+    if not items:
+        raise RuntimeError("No ESA WorldCover 2021 tiles cover the Montrose AOI")
+
+    landcover = load(
+        items, bands=["map"], bbox=bbox, crs=CRS, resolution=10, resampling="nearest",
+        groupby=lambda *_: 0, patch_url=planetary_computer.sign, fail_on_error=True,
+    )["map"].isel(time=0)
+    values = landcover.values
+    valid = np.isfinite(values) & (values > 0)
+    if not valid.any():
+        raise RuntimeError("ESA WorldCover returned no valid pixels for Montrose")
+    classes = np.where(valid, values, 0).astype("uint8")
+    transform = landcover.rio.transform()
+    with TemporaryDirectory(dir=output) as temp:
+        staged = Path(temp) / path.name
+        with rasterio.open(
+            staged, "w", driver="GTiff", width=classes.shape[1], height=classes.shape[0],
+            count=1, dtype="uint8", crs=CRS, transform=transform, nodata=0, compress="deflate",
+        ) as raster:
+            raster.write(classes, 1)
+            raster.write_colormap(1, WORLDCOVER_PALETTE)
+            raster.set_band_description(1, "ESA WorldCover 2021 land-cover class")
+            raster.update_tags(aoi_key=area_key, class_50="Built-up", class_80="Permanent water bodies")
+        staged.replace(path)
+    return exclusion_polygons(classes, transform)
 
 
-def read_bng(path):
-    return gpd.read_file(path).to_crs(CRS)
+def exclusion_polygons(classes, transform):
+    excluded = np.isin(classes, (50, 80))
+    polygons = []
+    for geometry, _ in shapes(excluded.astype("uint8"), mask=excluded, transform=transform):
+        polygon = shape(geometry)
+        polygons.append(polygon if polygon.is_valid else polygon.buffer(0))
+    return unary_union(polygons)
 
 
-def tide_heights(ds, year, args):
-    if args.tide_cache:
-        file = args.tide_cache / f"{year}_tides.nc"
-        if file.is_file():
-            with xr.open_dataset(file) as cached:
-                tides = cached["tide_m"]
-                if (
-                    np.array_equal(tides.x, ds.x)
-                    and np.array_equal(tides.y, ds.y)
-                    and np.isin(ds.time.values, tides.time.values).all()
-                ):
-                    print(f"Reusing {file}")
-                    return tides.sel(time=ds.time).transpose("time", "y", "x").load()
-
-    tides = pixel_tides(data=ds, model=TIDE_MODEL, directory=args.tide_model_dir,
-                        resample=True).transpose("time", "y", "x")
-    # Require matching coordinates before applying the tide mask.
-    return xr.align(ds.ndvi, tides, join="exact")[1]
+@cache
+def dem_for_grid(bbox, resolution):
+    return load_dem_stac(bbox, output_crs=CRS, resolution=resolution).compute()
 
 
-def make_composites(ndvi, tides, min_tide):
-    """Compare the same valid NDVI observations, changing only the tide mask."""
-    layers = {}
-    for mode, stack in (("all_clear", ndvi), ("tide_filtered", ndvi.where(tides >= min_tide))):
-        layers[f"{mode}_ndvi"] = stack.median("time", skipna=True)
-        layers[f"{mode}_count"] = stack.count("time").astype("int16")
-        layers[f"{mode}_stdev"] = stack.std("time", skipna=True)
-        layers[f"{mode}_tide"] = tides.where(stack.notnull()).median("time", skipna=True)
-    return xr.Dataset(layers)
+def summer_composite(sensor, year, bbox, output):
+    resolution, loader = SENSORS[sensor]
+    start = date(year, FIRST_MONTH, 1)
+    end = date(year, LAST_MONTH, monthrange(year, LAST_MONTH)[1])
+    settings = (sensor, bbox, CRS, resolution, start.isoformat(), end.isoformat(), 1)
+    key = sha256(repr(settings).encode()).hexdigest()[:16]
+    path = output / "composites" / f"{sensor}_{year}_{key}.nc"
+    if path.is_file():
+        print(f"  Reusing {path.name}", flush=True)
+        with xr.open_dataset(path) as saved:
+            return saved.load()
 
-
-def annual_composites(year, bbox, args):
-    first, last = args.months
-    start = pd.Timestamp(year, first, 1)
-    end = pd.Timestamp(year, last, 1) + pd.offsets.MonthEnd()
-    resolution = 10 if args.sensor == "sentinel2" else RESOLUTION
-    cache_settings = (bbox, CRS, resolution, str(start), str(end), TIDE_MODEL, args.min_tide,
-                      str(args.tide_model_dir.resolve()), str(args.tide_cache), 2)
-    if args.sensor == "sentinel2":
-        cache_settings += (args.sensor,)
-    cache_key = hashlib.sha256(repr(cache_settings).encode()).hexdigest()[:16]
-    cache = args.output / "composites" / f"{year}_{cache_key}.nc"
-    if cache.is_file():
-        with xr.open_dataset(cache) as saved:
-            return saved.load().rio.write_crs(CRS)
-
-    dem = load_dem_stac(bbox, output_crs=CRS, resolution=resolution).compute()
-    loader = load_sentinel2_indices_stac if args.sensor == "sentinel2" else load_water_index_stac
-    ds = loader(
-        bbox,
-        f"{start:%Y-%m-%d}/{end:%Y-%m-%d}",
-        output_crs=CRS,
-        resolution=resolution,
-        dem=dem,
-        mask_terrain_shadow=True,
-        include_ndvi=True,
+    imagery = loader(
+        bbox, f"{start}/{end}", output_crs=CRS, resolution=resolution,
+        dem=dem_for_grid(bbox, resolution), mask_terrain_shadow=True, include_ndvi=True,
     )
-    tides = tide_heights(ds, year, args).compute()
-    ndvi = ds.ndvi.transpose("time", "y", "x").compute()
-    result = make_composites(ndvi, tides, args.min_tide)
-    diagnostics = summarise_observations(ndvi, tides, args.min_tide)
-    # Keep only plain grid coordinates and arrays in the cache.
-    saved = xr.Dataset(
-        {name: (layer.dims, layer.values)
-         for name, layer in result.data_vars.items()},
-        coords={"x": result.x.values, "y": result.y.values},
-    ).merge(diagnostics, join="exact")
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    with TemporaryDirectory(dir=cache.parent) as temp:
-        staged = Path(temp) / cache.name
-        saved.to_netcdf(staged)
-        staged.replace(cache)
-    return saved.rio.write_crs(CRS)
+    ndvi = imagery.ndvi.transpose("time", "y", "x").compute()
+    composite = xr.Dataset({
+        "ndvi": (("y", "x"), ndvi.median("time", skipna=True).values),
+        "count": (("y", "x"), ndvi.count("time").values.astype("int32")),
+    }, coords={"x": ndvi.x.values, "y": ndvi.y.values})
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(dir=path.parent) as temp:
+        staged = Path(temp) / path.name
+        composite.to_netcdf(staged)
+        staged.replace(path)
+    return composite
 
 
 def line_parts(geometry):
@@ -157,145 +144,63 @@ def line_parts(geometry):
             yield from line_parts(part)
 
 
-def threshold_contours(ndvi, count, args):
-    ndvi = ndvi.where(count >= args.min_count).rio.write_crs(CRS)
+def vegetation_edges(composite, corridor):
+    ndvi = composite.ndvi.where(composite["count"] >= MIN_OBSERVATIONS).rio.write_crs(CRS)
     values = ndvi.values
     valid = values[np.isfinite(values)]
-    if valid.size and valid.min() < args.threshold < valid.max():
-        # Disconnected or masked pixels may produce no contours.
-        return subpixel_contours(ndvi, z_values=args.threshold, crs=CRS,
-                                 min_vertices=2, errors="ignore", verbose=False)
-    return gpd.GeoDataFrame(geometry=[], crs=CRS)
+    if not valid.size or not valid.min() < NDVI_THRESHOLD < valid.max():
+        return []
 
-
-def extract_candidates(ndvi, count, corridor, args, year, mode, raw=None):
-    if raw is None:
-        raw = threshold_contours(ndvi, count, args)
-    segments = []
-    for line in raw.geometry:
-        segments.extend(part for part in line_parts(line.intersection(corridor))
-                        if part.length >= args.min_length)
-    return gpd.GeoDataFrame(
-        {"year": [year] * len(segments), "indicator": ["DEA_VEdge_candidate"] * len(segments),
-         "sensor": [args.sensor] * len(segments),
-         "tide_mode": [mode] * len(segments), "ndvi_threshold": [args.threshold] * len(segments),
-         "min_observations": [args.min_count] * len(segments),
-         "min_tide_m": [args.min_tide if mode == "tide_filtered" else None] * len(segments)},
-        geometry=segments, crs=CRS,
+    contours = subpixel_contours(
+        ndvi, z_values=NDVI_THRESHOLD, crs=CRS, min_vertices=2, errors="ignore", verbose=False,
     )
-
-
-def compare_transects(transects, references, edges):
-    coast = {mode: unary_union(frame.geometry) for mode, frame in edges.items()}
-    records = []
-    for date, group in references.groupby("Date"):
-        reference = unary_union(group.geometry)
-        for transect in transects.itertuples():
-            crossing = transect.geometry.intersection(reference)
-            if crossing.is_empty or crossing.geom_type != "Point":
-                continue
-            row = {"reference_date": date, "transect_id": transect.TransectID}
-            for mode, candidates in coast.items():
-                point = transect.geometry.intersection(candidates)
-                row[f"{mode}_status"] = (
-                    "missing" if point.is_empty else "unique" if point.geom_type == "Point"
-                    else "ambiguous"
-                )
-                row[f"{mode}_offset_m"] = (
-                    transect.geometry.project(point) - transect.geometry.project(crossing)
-                    if row[f"{mode}_status"] == "unique" else np.nan
-                )
-            records.append(row)
-    return pd.DataFrame(records, columns=[
-        "reference_date", "transect_id", "all_clear_status", "all_clear_offset_m",
-        "tide_filtered_status", "tide_filtered_offset_m",
-    ])
-
-
-def save_map(path, year, composites, edges, references, corridor, args):
-    fig, axes = plt.subplots(2, 2, figsize=(11, 11), layout="constrained")
-    bounds = corridor.bounds
-    max_count = max(args.min_count, int(composites.all_clear_count.max()))
-    for column, (mode, label) in enumerate(TIDE_MODES.items()):
-        ndvi = composites[f"{mode}_ndvi"]
-        count = composites[f"{mode}_count"]
-        ndvi.where(count >= args.min_count).plot.imshow(
-            ax=axes[0, column], vmin=-0.2, vmax=0.8, cmap="BrBG",
-            cbar_kwargs={"label": "Median NDVI"},
-        )
-        count.astype(float).plot.imshow(
-            ax=axes[1, column], vmin=0, vmax=max_count, cmap="viridis",
-            cbar_kwargs={"label": "Valid observations"},
-        )
-        if not edges[mode].empty:
-            edges[mode].plot(ax=axes[0, column], color="magenta", linewidth=1)
-        if not references.empty:
-            references.plot(ax=axes[0, column], color="black", linewidth=0.8, linestyle="--")
-        for row in range(2):
-            ax = axes[row, column]
-            ax.set(xlim=(bounds[0], bounds[2]), ylim=(bounds[1], bounds[3]), aspect="equal",
-                   title=f"{label} · {'NDVI and contours' if row == 0 else 'coverage'}",
-                   xlabel="BNG easting (m)", ylabel="BNG northing (m)")
-    sensor_label = "Sentinel-2" if args.sensor == "sentinel2" else "Landsat"
-    fig.suptitle(f"{sensor_label} {year}   NDVI {args.threshold:g}   Minimum tide {args.min_tide:+g} m rel. MSL"
-                 "\nMagenta: contour candidates   Dashed black: mapped vegetation edges")
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    return [
+        part
+        for contour in contours.geometry
+        for part in line_parts(contour.intersection(corridor))
+        if part.length >= MIN_LENGTH_METRES
+    ]
 
 
 def main():
-    args = parse_args()
-    aois = read_bng(args.aoi)
-    area = unary_union(aois.geometry)
-    bbox = tuple(float(value) for value in aois.to_crs("EPSG:4326").total_bounds)
-    shorelines = read_bng(args.shorelines)
-    coastal_buffers = shorelines.geometry.simplify(RESOLUTION / 6).buffer(args.corridor)
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    aoi = gpd.read_file(INPUTS / "aoi.geojson")
+    bbox = tuple(float(value) for value in aoi.to_crs("EPSG:4326").total_bounds)
+    area = unary_union(aoi.to_crs(CRS).geometry)
+    shorelines = gpd.read_file(INPUTS / "msl.geojson").to_crs(CRS)
+    coastal_buffers = shorelines.geometry.simplify(5).buffer(CORRIDOR_METRES)
     corridor = unary_union(coastal_buffers).intersection(area)
     if corridor.is_empty:
-        raise ValueError("The MSL shoreline search corridor does not overlap the AOI")
-    references = read_bng(args.references).clip(corridor)
-    dates = pd.to_datetime(references.Date, format="%Y-%m-%d", errors="coerce")
-    if dates.isna().any():
-        raise ValueError("Reference features within the corridor must have ISO dates (YYYY-MM-DD)")
-    transects = read_bng(args.transects)
-    transects = transects[transects.intersects(corridor)]
+        raise ValueError("The coastal search corridor does not overlap the Montrose AOI")
 
-    args.output.mkdir(parents=True, exist_ok=True)
-    for year in dict.fromkeys(args.years):
-        print(f"Processing {year}")
-        composites = annual_composites(year, bbox, args)
-        year_dir = args.output / str(year)
-        year_dir.mkdir(exist_ok=True)
-        reference = references[(dates.dt.year == year)
-                               & dates.dt.month.between(*args.months)]
-        raw, edges = {}, {}
-        with TemporaryDirectory(dir=year_dir) as temp:
-            staged = Path(temp)
-            for mode in TIDE_MODES:
-                ndvi = composites[f"{mode}_ndvi"]
-                count = composites[f"{mode}_count"]
-                ndvi.rio.write_nodata(np.nan, encoded=True).rio.to_raster(staged / f"{mode}_ndvi.tif")
-                count.rio.to_raster(staged / f"{mode}_count.tif")
-                raw[mode] = threshold_contours(ndvi, count, args)
-                edges[mode] = extract_candidates(ndvi, count, corridor, args, year, mode,
-                                                 raw=raw[mode])
-                (staged / f"{mode}_vegetation_edge.geojson").write_text(
-                    edges[mode].to_crs("EPSG:4326").to_json(drop_id=True), encoding="utf-8"
+    exclusion = worldcover_mask(bbox, OUTPUT)
+    with TemporaryDirectory(dir=OUTPUT) as temp:
+        staging = Path(temp)
+        for sensor in SENSORS:
+            unmasked, masked = [], []
+            for year in YEARS:
+                print(f"{sensor} {year}", flush=True)
+                composite = summer_composite(sensor, year, bbox, OUTPUT)
+                lines = vegetation_edges(composite, corridor)
+                properties = {"year": year, "sensor": sensor, "indicator": "DEA_VEdge_candidate",
+                              "ndvi_threshold": NDVI_THRESHOLD, "min_observations": MIN_OBSERVATIONS}
+                unmasked.extend({**properties, "geometry": line} for line in lines)
+                masked.extend(
+                    {**properties, "geometry": part}
+                    for line in lines
+                    for part in line_parts(line.difference(exclusion))
                 )
-                print(f"  {mode}: {len(edges[mode])} candidate segments")
-            comparison = compare_transects(transects, reference, edges)
-            comparison.to_csv(staged / "transect_comparison.csv", index=False)
-            paired = comparison.dropna(subset=["all_clear_offset_m", "tide_filtered_offset_m"])
-            if len(paired):
-                errors = paired[["all_clear_offset_m", "tide_filtered_offset_m"]].abs().mean()
-                print(f"  Mean absolute offset on {len(paired)} paired transect-date matches: "
-                      f"{errors.all_clear_offset_m:.1f} m all-clear, "
-                      f"{errors.tide_filtered_offset_m:.1f} m tide-filtered")
-            save_map(staged / "comparison.png", year, composites, edges, reference, corridor, args)
-            save_diagnostics(staged, year, composites, raw, edges, reference, corridor,
-                             comparison, args, TIDE_MODES)
-            for product in staged.iterdir():
-                product.replace(year_dir / product.name)
+
+            columns = ["year", "sensor", "indicator", "ndvi_threshold", "min_observations", "geometry"]
+            for variant, records in (("unmasked", unmasked), ("masked", masked)):
+                edges = gpd.GeoDataFrame(records, columns=columns, geometry="geometry", crs=CRS)
+                path = staging / f"{sensor}_vegetation_edges_{variant}.geojson"
+                path.write_text(edges.to_crs("EPSG:4326").to_json(drop_id=True), encoding="utf-8")
+
+        for path in sorted(staging.iterdir()):
+            target = OUTPUT / path.name
+            path.replace(target)
+            print(f"Wrote {target}")
 
 
 if __name__ == "__main__":
