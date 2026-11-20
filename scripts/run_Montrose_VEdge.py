@@ -5,26 +5,26 @@ from calendar import monthrange
 from datetime import date
 from functools import cache
 from hashlib import sha256
+from math import ceil, floor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import sleep
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 import geopandas as gpd
 import numpy as np
-import planetary_computer
-import pystac_client
 import rasterio
 import rioxarray
 import xarray as xr
 from dea_tools.spatial import subpixel_contours
-from odc.stac import load
 from pystac_client.exceptions import APIError
 from rasterio.features import shapes
+from rasterio.io import MemoryFile
 from shapely.geometry import shape
 from shapely.ops import unary_union
 
 from coastlines.stac import (
-    PLANETARY_COMPUTER_STAC,
     load_dem_stac,
     load_sentinel2_indices_stac,
     load_water_index_stac,
@@ -47,11 +47,21 @@ SENSORS = {
     "landsat": (30, load_water_index_stac),
     "sentinel2": (10, load_sentinel2_indices_stac),
 }
-WORLDCOVER_PALETTE = {
-    10: (0, 100, 0), 20: (255, 187, 34), 30: (255, 255, 76),
-    40: (240, 150, 255), 50: (250, 0, 0), 60: (180, 180, 180),
-    70: (240, 240, 240), 80: (0, 100, 200), 90: (0, 150, 160),
-    95: (0, 207, 117), 100: (250, 230, 160),
+NATURESCOT_WCS = "https://ogc.nature.scot/geoserver/habitatsandspecies/wcs"
+NATURESCOT_COVERAGE = "habitatsandspecies:HLCM_2024_EUNIS_LEVEL2"
+# Raster values from the NatureScot Level 2 legend (P: Water; J: Built-up).
+EXCLUDED_LAND_COVER = (1, 22)
+NATURESCOT_PALETTE = {
+    1: (32, 33, 218), 2: (132, 40, 0), 3: (140, 64, 0),
+    4: (92, 63, 0), 5: (128, 148, 89), 6: (204, 202, 117),
+    7: (227, 207, 118), 8: (170, 143, 165), 9: (172, 113, 125),
+    10: (123, 91, 149), 11: (125, 70, 39), 12: (84, 39, 63),
+    13: (57, 144, 100), 14: (55, 116, 41), 15: (0, 44, 20),
+    16: (73, 105, 82), 17: (0, 73, 40), 18: (48, 156, 84),
+    19: (144, 137, 76), 20: (179, 123, 60), 21: (215, 127, 63),
+    22: (22, 23, 21), 24: (80, 80, 75), 25: (49, 195, 138),
+    26: (255, 100, 255), 27: (255, 173, 232), 28: (255, 195, 186),
+    29: (149, 111, 30),
 }
 
 
@@ -68,52 +78,54 @@ def retry_catalog(label, operation, *args, **kwargs):
             sleep(delay)
 
 
-def worldcover_items(bbox):
-    catalog = pystac_client.Client.open(PLANETARY_COMPUTER_STAC)
-    return list(catalog.search(
-        collections=["esa-worldcover"], bbox=bbox, datetime="2021-01-01/2021-12-31"
-    ).items())
-
-
-def worldcover_mask(bbox, output):
-    """Save the full 10 m class raster and return its built-up and water polygons."""
-    path = output / "worldcover_2021.tif"
-    area_key = sha256(repr(bbox).encode()).hexdigest()[:16]
+def naturescot_mask(area_bounds, output):
+    """Fetch and cache the NatureScot 2024 land-cover raster on its 10 m grid."""
+    west, south, east, north = area_bounds
+    bounds = (
+        floor(west / 10) * 10, floor(south / 10) * 10,
+        ceil(east / 10) * 10, ceil(north / 10) * 10,
+    )
+    path = output / "naturescot_landcover_2024.tif"
     if path.is_file():
         with rasterio.open(path) as raster:
-            if raster.tags().get("aoi_key") == area_key:
+            if raster.bounds == bounds and raster.tags().get("coverage") == NATURESCOT_COVERAGE:
                 return exclusion_polygons(raster.read(1), raster.transform)
 
-    items = retry_catalog("WorldCover catalogue", worldcover_items, bbox)
-    if not items:
-        raise RuntimeError("No ESA WorldCover 2021 tiles cover the Montrose AOI")
+    query = urlencode({
+        "service": "WCS", "version": "1.0.0", "request": "GetCoverage",
+        "coverage": NATURESCOT_COVERAGE, "CRS": CRS, "bbox": ",".join(map(str, bounds)),
+        "resx": 10, "resy": 10, "format": "GeoTIFF",
+    })
+    with urlopen(f"{NATURESCOT_WCS}?{query}", timeout=60) as response:
+        data = response.read()
 
-    landcover = load(
-        items, bands=["map"], bbox=bbox, crs=CRS, resolution=10, resampling="nearest",
-        groupby=lambda *_: 0, patch_url=planetary_computer.sign, fail_on_error=True,
-    )["map"].isel(time=0)
-    values = landcover.values
-    valid = np.isfinite(values) & (values > 0)
-    if not valid.any():
-        raise RuntimeError("ESA WorldCover returned no valid pixels for Montrose")
-    classes = np.where(valid, values, 0).astype("uint8")
-    transform = landcover.rio.transform()
+    if not data.startswith((b"MM\x00*", b"II*\x00")):
+        raise RuntimeError("NatureScot WCS did not return a GeoTIFF")
+    with MemoryFile(data) as memory, memory.open() as raster:
+        if (raster.count != 1 or raster.crs != CRS
+                or raster.res != (10, 10) or raster.bounds != bounds):
+            raise RuntimeError("NatureScot WCS returned an unexpected raster grid")
+        classes = raster.read(1, masked=True).filled(0)
+        if not classes.any():
+            raise RuntimeError("NatureScot WCS returned no classified pixels for Montrose")
+        transform = raster.transform
+        profile = raster.profile
+
+    profile.update(nodata=0, compress="deflate")
     with TemporaryDirectory(dir=output) as temp:
         staged = Path(temp) / path.name
-        with rasterio.open(
-            staged, "w", driver="GTiff", width=classes.shape[1], height=classes.shape[0],
-            count=1, dtype="uint8", crs=CRS, transform=transform, nodata=0, compress="deflate",
-        ) as raster:
+        with rasterio.open(staged, "w", **profile) as raster:
             raster.write(classes, 1)
-            raster.write_colormap(1, WORLDCOVER_PALETTE)
-            raster.set_band_description(1, "ESA WorldCover 2021 land-cover class")
-            raster.update_tags(aoi_key=area_key, class_50="Built-up", class_80="Permanent water bodies")
+            raster.write_colormap(1, NATURESCOT_PALETTE)
+            raster.set_band_description(1, "NatureScot 2024 EUNIS Level 2 land-cover class")
+            raster.update_tags(coverage=NATURESCOT_COVERAGE, class_1="Water", class_22="Built-up")
         staged.replace(path)
+    print(f"Wrote {path}", flush=True)
     return exclusion_polygons(classes, transform)
 
 
 def exclusion_polygons(classes, transform):
-    excluded = np.isin(classes, (50, 80))
+    excluded = np.isin(classes, EXCLUDED_LAND_COVER)
     polygons = []
     for geometry, _ in shapes(excluded.astype("uint8"), mask=excluded, transform=transform):
         polygon = shape(geometry)
@@ -203,7 +215,7 @@ def main():
     if corridor.is_empty:
         raise ValueError("The coastal search corridor does not overlap the Montrose AOI")
 
-    exclusion = worldcover_mask(bbox, OUTPUT)
+    exclusion = naturescot_mask(area.bounds, OUTPUT)
     with TemporaryDirectory(dir=OUTPUT) as temp:
         staging = Path(temp)
         for sensor in SENSORS:
@@ -226,7 +238,7 @@ def main():
                 )
 
             columns = ["year", "sensor", "indicator", "ndvi_threshold", "min_observations", "geometry"]
-            for variant, records in (("unmasked", unmasked), ("masked", masked)):
+            for variant, records in (("unmasked", unmasked), ("masked_naturescot", masked)):
                 edges = gpd.GeoDataFrame(records, columns=columns, geometry="geometry", crs=CRS)
                 path = staging / f"{sensor}_vegetation_edges_{variant}.geojson"
                 path.write_text(edges.to_crs("EPSG:4326").to_json(drop_id=True), encoding="utf-8")
