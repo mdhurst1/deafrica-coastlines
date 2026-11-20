@@ -23,7 +23,7 @@ DEFAULT_PLATFORMS = [
 
 def add_solar_angles(ds, items):
     """
-    Attach Landsat solar elevation and azimuth to an xarray
+    Attach solar elevation and azimuth to an xarray
     Dataset loaded using odc.stac.
 
     Solar angles are extracted from the STAC item metadata and
@@ -54,6 +54,10 @@ def add_solar_angles(ds, items):
         sun_azimuth = item.properties.get(
             "view:sun_azimuth"
         )
+        if sun_elevation is None and "s2:mean_solar_zenith" in item.properties:
+            sun_elevation = 90.0 - float(item.properties["s2:mean_solar_zenith"])
+        if sun_azimuth is None:
+            sun_azimuth = item.properties.get("s2:mean_solar_azimuth")
 
         if sun_elevation is None or sun_azimuth is None:
             print(
@@ -73,7 +77,7 @@ def add_solar_angles(ds, items):
     if len(item_metadata) == 0:
         raise RuntimeError(
             "No solar-angle metadata found in "
-            "the Landsat STAC items."
+            "the STAC items."
         )
 
     sun_elevations = []
@@ -131,6 +135,7 @@ def load_water_index_stac(
     mask_terrain_shadow=False,
     terrain_shadow_threshold=0.5,
     terrain_shadow_radius=1,
+    include_ndvi=False,
 ):
     """
     Load Landsat Collection 2 Level-2 imagery and calculate
@@ -152,6 +157,8 @@ def load_water_index_stac(
         Maximum scene-level cloud cover percentage.
     platforms : list, optional
         Landsat platforms to use.
+    include_ndvi : bool, optional
+        Also load red reflectance and return a cloud- and shadow-masked NDVI.
 
     Returns
     -------
@@ -195,12 +202,7 @@ def load_water_index_stac(
 
     ds = load(
         items,
-        bands=[
-            "green",
-            "nir08",
-            "swir16",
-            "qa_pixel",
-        ],
+        bands=["green", "nir08", "swir16", "qa_pixel"] + (["red"] if include_ndvi else []),
         bbox=bbox,
         crs=output_crs,
         resolution=resolution,
@@ -268,6 +270,13 @@ def load_water_index_stac(
     out["mndwi"] = mndwi
     out["ndwi"] = ndwi
 
+    # calculate NDVI if requested, using the same clear-sky mask as NDWI/MNDWI
+    if include_ndvi:
+        red = ds.red.where(ds.red != 0) * scale + offset
+        red = red.where((red >= 0) & (red <= 1))
+        total = nir + red
+        out["ndvi"] = ((nir - red) / total.where(total > 0)).where(clear)
+
     out["sun_elevation"] = ds.sun_elevation
     out["sun_azimuth"] = ds.sun_azimuth
 
@@ -287,6 +296,106 @@ def load_water_index_stac(
         )
 
     return out
+
+def _sentinel2_items(items):
+    """Deduplicate reprocessed tiles and assign one local timestamp per datatake."""
+    selected = {}
+    for item in items:
+        props = item.properties
+        baseline = tuple(int(part) for part in props["s2:processing_baseline"].split("."))
+        datatake = props["s2:datatake_id"].rsplit("_N", 1)[0]
+        key = datatake, props["s2:mgrs_tile"]
+        rank = baseline, props.get("s2:generation_time", ""), item.id
+        if key not in selected or rank > selected[key][0]:
+            selected[key] = rank, item
+
+    times = {}
+    for (datatake, _), (_, item) in selected.items():
+        times[datatake] = min(item.datetime, times.get(datatake, item.datetime))
+
+    groups = {0: [], 1000: []}
+    for (datatake, _), ((baseline, _, _), item) in selected.items():
+        item = item.clone()
+        item.datetime = times[datatake]
+        groups[1000 if baseline >= (4, 0) else 0].append(item)
+    return groups
+
+
+def _sentinel2_indices(ds, offset, include_ndvi):
+    # SCL 2 included dark water for older baselines. Keep it and let the
+    # separate terrain mask identify topographic shadows when requested.
+    clear = ds.SCL.isin([2, 4, 5, 6])
+
+    def reflectance(band):
+        dn = ds[band].where(ds[band] > 0)
+        return ((dn.astype("float32") - offset) / 10000).clip(min=0).where(clear)
+
+    def normalized_difference(a, b):
+        total = a + b
+        return (a - b) / total.where(total > 0)
+
+    green, nir, swir = (reflectance(band) for band in ("B03", "B08", "B11"))
+    out = ds[[]].copy()
+    out["mndwi"] = normalized_difference(green, swir)
+    out["ndwi"] = normalized_difference(green, nir)
+    if include_ndvi:
+        out["ndvi"] = normalized_difference(nir, reflectance("B04"))
+    return out
+
+
+def load_sentinel2_indices_stac(
+    bbox,
+    datetime,
+    output_crs="EPSG:27700",
+    resolution=20,
+    cloud_cover=80,
+    fail_on_error=True,
+    dem=None,
+    mask_terrain_shadow=False,
+    terrain_shadow_threshold=0.5,
+    terrain_shadow_radius=1,
+    include_ndvi=False,
+):
+    """Load Planetary Computer Sentinel-2 L2A indices on one projected grid."""
+    catalog = pystac_client.Client.open(PLANETARY_COMPUTER_STAC)
+    items = catalog.search(
+        collections=["sentinel-2-l2a"],
+        bbox=bbox,
+        datetime=datetime,
+        query={"eo:cloud_cover": {"lt": cloud_cover}},
+    ).item_collection()
+    if not items:
+        raise RuntimeError(f"No Sentinel-2 L2A scenes found for bbox={bbox}, datetime={datetime}")
+
+    groups = _sentinel2_items(items)
+    print(f"Found {sum(map(len, groups.values()))} Sentinel-2 tiles after deduplication")
+    bands = ["B03", "B08", "B11", "SCL"]
+    if include_ndvi:
+        bands.append("B04")
+    indices = []
+    for offset, group in groups.items():
+        if not group:
+            continue
+        tiles = load(
+            group, bands=bands, bbox=bbox, crs=output_crs, resolution=resolution,
+            groupby="time", resampling="nearest", chunks={"time": 1, "x": 1024, "y": 1024},
+            patch_url=planetary_computer.sign, fail_on_error=fail_on_error,
+        )
+        indices.append(_sentinel2_indices(tiles, offset, include_ndvi))
+    # Correct each processing-baseline group before mosaicking reflectance
+    # indices; tiles from adjoining processing runs can share an acquisition.
+    out = indices[-1]
+    if len(indices) == 2:
+        out = out.combine_first(indices[0]).sortby("time")
+    if mask_terrain_shadow:
+        if dem is None:
+            raise ValueError("A DEM is required for Sentinel-2 terrain shadow masking")
+        out = add_solar_angles(out, groups[0] + groups[1000])
+        out = terrain_shadow_masking_stac(
+            out, dem, threshold=terrain_shadow_threshold, radius=terrain_shadow_radius
+        )
+    return out
+
 
 def load_dem_stac(
     bbox,
@@ -549,14 +658,8 @@ def terrain_shadow_masking_stac(
     ds["terrain_shadow"] = terrain_shadow
 
     # Apply terrain-shadow masking
-    if "mndwi" in ds:
-        ds["mndwi"] = ds["mndwi"].where(
-            ~terrain_shadow
-        )
-
-    if "ndwi" in ds:
-        ds["ndwi"] = ds["ndwi"].where(
-            ~terrain_shadow
-        )
+    for index in ("mndwi", "ndwi", "ndvi"):
+        if index in ds:
+            ds[index] = ds[index].where(~terrain_shadow)
 
     return ds
